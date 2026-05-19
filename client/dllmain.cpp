@@ -34,18 +34,32 @@ void ResolveIniPath(wchar_t* out, size_t cap) {
 }
 
 void InitWorker() {
+    OutputDebugStringA("[l2voice] InitWorker started\n");
     wchar_t ini_path[MAX_PATH];
     ResolveIniPath(ini_path, MAX_PATH);
 
     voice::Config cfg;
-    if (!voice::LoadConfigFromIni(ini_path, &cfg)) {
+    bool fromIni = voice::LoadConfigFromIni(ini_path, &cfg);
+    if (!fromIni) {
         cfg = voice::DefaultConfig();
     }
-    if (!cfg.enabled) return;
+    char dbg[512];
+    _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+        "[l2voice] config %s enabled=%d auto_connect=%d ws_url=%s ptt=%d\n",
+        fromIni ? "from voice.ini" : "default",
+        cfg.enabled, cfg.auto_connect, cfg.ws_url, cfg.ptt_proximity);
+    OutputDebugStringA(dbg);
+
+    if (!cfg.enabled) {
+        OutputDebugStringA("[l2voice] disabled by config; bridge inert\n");
+        return;
+    }
 
     if (!voice::Init(cfg)) {
-        OutputDebugStringA("[l2voice] voice::Init failed\n");
+        OutputDebugStringA("[l2voice] voice::Init FAILED\n");
+        return;
     }
+    OutputDebugStringA("[l2voice] voice::Init OK (audio devices opened, ws connecting)\n");
 }
 
 void Shutdown() {
@@ -60,9 +74,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID /*reserved*/) {
         case DLL_PROCESS_ATTACH:
             g_module = hModule;
             DisableThreadLibraryCalls(hModule);
+            OutputDebugStringA("[l2voice] DLL_PROCESS_ATTACH\n");
             g_init_thread = std::thread(InitWorker);
             break;
         case DLL_PROCESS_DETACH:
+            OutputDebugStringA("[l2voice] DLL_PROCESS_DETACH\n");
             Shutdown();
             break;
     }

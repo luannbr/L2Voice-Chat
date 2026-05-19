@@ -89,6 +89,7 @@ func handleWS(ctx context.Context, w http.ResponseWriter, r *http.Request, state
 		return
 	}
 	defer conn.Close()
+	log.Printf("control: %s connected (UA=%q)", r.RemoteAddr, r.Header.Get("User-Agent"))
 
 	// Read auth as the first message; deadline so a non-talking
 	// client can't sit on a socket forever.

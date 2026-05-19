@@ -157,6 +157,9 @@ bool Init(const Config& cfg) {
         g_mod.net.Start(cfg.ws_url,
                         [](uint32_t /*sid*/, const char*, uint16_t) {},
                         &OnIncomingPacket);
+        // No client-side token. The DLL waits for SetAuthToken to be
+        // called from the chat sentinel hook (engine.dll chat-receive),
+        // which delivers the token L2J minted at EnterWorld.
     }
 
     g_mod.running.store(true);
