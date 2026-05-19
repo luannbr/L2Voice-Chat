@@ -25,13 +25,14 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 
         <!--
-          Adjust this to point at the actual L2J GS classes/jar in your
-          environment. The Ant build puts the jar at:
-            ../../542_2026/Source-GS_SR-542-main/build/gameserver/l2emu-gs.jar
+          Path to the GS jar produced by the Ant build at:
+            Source-GS_SR-542-main/build/l2emu-core-e-<version>.jar
           The bridge does NOT bundle L2J; it imports L2J types at
-          compile-time and runs inside the GS JVM at runtime.
+          compile-time only and runs inside the GS JVM at runtime.
+          (Currently the bridge uses 100% reflection so this dep is
+          actually optional — kept here for future direct-import code.)
         -->
-        <l2j.gs.jar>${project.basedir}/../../542_2026/Source-GS_SR-542-main/build/gameserver/l2emu-gs.jar</l2j.gs.jar>
+        <l2j.gs.jar>${project.basedir}/../../../542_2026/Source-GS_SR-542-main/build/l2emu-core-e-6.7.0.jar</l2j.gs.jar>
     </properties>
 
     <dependencies>

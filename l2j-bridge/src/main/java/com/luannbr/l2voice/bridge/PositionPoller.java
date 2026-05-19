@@ -90,22 +90,19 @@ final class PositionPoller {
 
     /**
      * Reflection helper. Bound to the Essence 542 class layout:
-     *   {@code net.l2emuproject.gameserver.world.L2World#getAllPlayers()}
+     *   {@code net.l2emuproject.gameserver.model.L2World#getAllPlayers()} (static)
      *   {@code net.l2emuproject.gameserver.model.actor.instance.L2PcInstance}
      *   — getObjectId(), getX(), getY(), getZ(), getInstanceId()
      */
     private static final class L2WorldReflector {
-        private final Object       worldInstance;
-        private final Method       getAllPlayers;
+        private final Method       getAllPlayers;     // static
         private final Method       getObjectId;
         private final Method       getX, getY, getZ;
         private final Method       getInstanceId;
 
         L2WorldReflector() throws Exception {
-            Class<?> world = Class.forName("net.l2emuproject.gameserver.world.L2World");
-            // getInstance() (singleton)
-            worldInstance = world.getMethod("getInstance").invoke(null);
-            getAllPlayers = world.getMethod("getAllPlayers");
+            Class<?> world = Class.forName("net.l2emuproject.gameserver.model.L2World");
+            getAllPlayers = world.getMethod("getAllPlayers");  // static, no args
 
             Class<?> pc = Class.forName(
                     "net.l2emuproject.gameserver.model.actor.instance.L2PcInstance");
@@ -122,7 +119,7 @@ final class PositionPoller {
         }
 
         void forEachPlayer(Sink sink) throws Exception {
-            Object res = getAllPlayers.invoke(worldInstance);
+            Object res = getAllPlayers.invoke(null);  // static call
             if (res instanceof Iterable<?> iter) {
                 for (Object p : iter) snapshot(p, sink);
             } else if (res instanceof Object[] arr) {
