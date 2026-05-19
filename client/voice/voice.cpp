@@ -10,16 +10,21 @@
 #include "voice.h"
 #include "audio_io.h"
 #include "opus_codec.h"
-#include "user_hook.h"
 #include "voice_network.h"
 
+#include <winsock2.h>      // must precede iphlpapi.h
 #include <windows.h>
+#include <iphlpapi.h>
+#pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "ws2_32.lib")
+
 #include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 namespace voice {
 
@@ -109,8 +114,41 @@ Config DefaultConfig() {
     c.ptt_ally      = 'M';
     c.enabled       = true;
     c.auto_connect  = true;
-    c.player_id     = 0;
     return c;
+}
+
+// Enumerates this process's owned TCP connections and returns the local
+// (source) ports. The bridge will match these against L2GameClient
+// remote ports to figure out which player this DLL belongs to.
+//
+// We skip the loopback (127.0.0.1) side and the WS port itself so the
+// list doesn't include the voice-server connection. Everything else is
+// fair game — bridge knows which port is the game socket.
+std::vector<uint16_t> EnumerateOwnTcpPorts(uint16_t exclude_remote_port) {
+    std::vector<uint16_t> out;
+    DWORD pid = GetCurrentProcessId();
+    DWORD size = 0;
+    GetExtendedTcpTable(nullptr, &size, FALSE, AF_INET,
+                        TCP_TABLE_OWNER_PID_ALL, 0);
+    if (size == 0) return out;
+    std::vector<uint8_t> buf(size);
+    if (GetExtendedTcpTable(buf.data(), &size, FALSE, AF_INET,
+                            TCP_TABLE_OWNER_PID_ALL, 0) != NO_ERROR) {
+        return out;
+    }
+    auto* tbl = reinterpret_cast<MIB_TCPTABLE_OWNER_PID*>(buf.data());
+    for (DWORD i = 0; i < tbl->dwNumEntries; ++i) {
+        const MIB_TCPROW_OWNER_PID& r = tbl->table[i];
+        if (r.dwOwningPid != pid) continue;
+        uint16_t localPort  = ntohs((u_short)r.dwLocalPort);
+        uint16_t remotePort = ntohs((u_short)r.dwRemotePort);
+        if (remotePort == exclude_remote_port) continue;
+        // Only ESTABLISHED connections — listening sockets don't have
+        // a meaningful "remote" the GS knows about.
+        if (r.dwState != MIB_TCP_STATE_ESTAB) continue;
+        out.push_back(localPort);
+    }
+    return out;
 }
 
 bool LoadConfigFromIni(const wchar_t* path, Config* out) {
@@ -137,10 +175,11 @@ bool LoadConfigFromIni(const wchar_t* path, Config* out) {
     c.ptt_ally       = getI(L"ptt_ally",       c.ptt_ally);
     c.enabled        = getI(L"enabled", 1) != 0;
     c.auto_connect   = getI(L"auto_connect", 1) != 0;
-    c.player_id      = (uint32_t)getI(L"player_id", 0);
     *out = c;
     return true;
 }
+
+void RefreshClientPorts();   // fwd decl
 
 bool Init(const Config& cfg) {
     if (g_mod.running.load()) return true;
@@ -160,29 +199,33 @@ bool Init(const Config& cfg) {
         g_mod.net.Start(cfg.ws_url,
                         [](uint32_t /*sid*/, const char*, uint16_t) {},
                         &OnIncomingPacket);
-        // Pre-arm with whatever ini/env gave us (fallback path). If the
-        // engine.dll hook discovers a real ObjectId later, the callback
-        // below overwrites it before the next auth attempt.
-        if (cfg.player_id != 0) {
-            g_mod.net.SetAuthToken("", cfg.player_id);
-        }
-
-        // Try to install the engine.dll hook for auto-detection.
-        // Callback overrides the configured player_id once the local
-        // player's User::SetName fires.
-        InstallUserHook([](uint32_t pid) {
-            g_mod.cfg.player_id = pid;
-            g_mod.net.SetAuthToken("", pid);
-        });
+        // Identity is resolved server-side via TCP source-port matching.
+        // The bridge correlates this DLL's local-port list against
+        // L2GameClient remote ports → returns the player_id. We push an
+        // initial snapshot here and refresh on each WS reconnect (see
+        // OnRenderFrame).
+        RefreshClientPorts();
     }
 
     g_mod.running.store(true);
     return true;
 }
 
+void RefreshClientPorts() {
+    // Exclude the WS connection itself (port 17667 by default). We
+    // could parse cfg.ws_url for the actual port, but 17667 is the
+    // default and adding a few extras to the list is harmless.
+    auto ports = EnumerateOwnTcpPorts(/*exclude_remote_port*/ 17667);
+    char dbg[128];
+    _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+        "[l2voice] RefreshClientPorts: %zu connections\n", ports.size());
+    OutputDebugStringA(dbg);
+    if (ports.empty()) return;
+    g_mod.net.SetClientPorts(ports.data(), ports.size());
+}
+
 void Shutdown() {
     if (!g_mod.running.exchange(false)) return;
-    UninstallUserHook();
     g_mod.capture.Stop();
     g_mod.net.Stop();
     g_mod.playback.Stop();
@@ -191,12 +234,17 @@ void Shutdown() {
 }
 
 void OnRenderFrame() {
-    // No-op in rev 2 — position comes from the server.
-    // Reserved for future HUD work (ImGui "X is speaking" badge).
+    // Refresh the TCP-port list periodically — by the time the user
+    // is in-world, their L2 client has opened the GS socket; before
+    // that there's nothing useful to send. Cheap (one syscall).
+    static int counter = 0;
+    if ((counter++ % 60) == 0) RefreshClientPorts();
 }
 
-void SetAuthToken(const char* token, uint32_t player_id) {
-    g_mod.net.SetAuthToken(token, player_id);
+void SetAuthToken(const char* /*token*/, uint32_t /*player_id*/) {
+    // Deprecated — identity is resolved server-side via TCP source-
+    // port matching now. Left as a no-op so the public API doesn't
+    // break callers that wired it up (none today).
 }
 
 bool HasActiveSpeakers() {

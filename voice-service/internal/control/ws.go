@@ -14,7 +14,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -22,20 +24,19 @@ import (
 	"github.com/luannbr/l2voice/voice-service/internal/topology"
 )
 
-// CheckEndpoint is the URL of the L2J bridge /voice/check endpoint.
-// Empty disables the check (stub-auth accepts any player_id). Set
-// from main.go via SetCheckEndpoint.
-var checkEndpoint string
+// WhoamiEndpoint is the URL of the L2J bridge /voice/whoami endpoint.
+// Required for identity resolution: the voice-service has no way to
+// know which player a WS connection belongs to without it.
+var whoamiEndpoint string
 
-// SetCheckEndpoint configures the L2J bridge URL. Called once at startup.
-func SetCheckEndpoint(url string) { checkEndpoint = url }
+// SetWhoamiEndpoint configures the L2J bridge URL. Called once at startup.
+func SetWhoamiEndpoint(url string) { whoamiEndpoint = url }
 
 // authMsg is the first message a client must send.
 type authMsg struct {
-	Type          string `json:"type"`
-	Token         string `json:"token"`
-	PlayerID      uint32 `json:"player_id"`
-	ClientVersion string `json:"client_version,omitempty"`
+	Type          string   `json:"type"`
+	Ports         []uint16 `json:"ports"`           // local TCP source ports owned by the L2.exe process
+	ClientVersion string   `json:"client_version,omitempty"`
 }
 
 // authOk is the success response.
@@ -115,37 +116,43 @@ func handleWS(ctx context.Context, w http.ResponseWriter, r *http.Request, state
 		return
 	}
 
-	// Identity check against the L2J bridge: is this player_id currently
-	// online in L2World? If the bridge isn't configured (dev / no GS),
-	// accept any player_id — useful for loopback and bench tests.
-	if checkEndpoint != "" {
-		ok, err := checkPlayerOnline(msg.PlayerID)
-		if err != nil {
-			log.Printf("control: /voice/check error for player=%d: %v", msg.PlayerID, err)
-			_ = conn.WriteJSON(authFail{Type: "auth_fail", Reason: "validate_error"})
-			return
-		}
-		if !ok {
-			log.Printf("control: %s rejected — player %d not online", r.RemoteAddr, msg.PlayerID)
-			_ = conn.WriteJSON(authFail{Type: "auth_fail", Reason: "player_not_online"})
-			return
-		}
+	if len(msg.Ports) == 0 {
+		_ = conn.WriteJSON(authFail{Type: "auth_fail", Reason: "no_ports"})
+		return
 	}
 
-	sess := state.AllocSession(msg.PlayerID)
+	// Extract client IP from the WS connection's remote addr.
+	clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
+
+	// Resolve identity server-side via /voice/whoami.
+	playerID, err := whoamiLookup(clientIP, msg.Ports)
+	if err != nil {
+		log.Printf("control: /voice/whoami error for %s: %v", r.RemoteAddr, err)
+		_ = conn.WriteJSON(authFail{Type: "auth_fail", Reason: "whoami_error"})
+		return
+	}
+	if playerID == 0 {
+		log.Printf("control: %s rejected — no matching online player (ports=%v)",
+			r.RemoteAddr, msg.Ports)
+		_ = conn.WriteJSON(authFail{Type: "auth_fail", Reason: "player_not_resolved"})
+		return
+	}
+
+	sess := state.AllocSession(playerID)
 	defer state.Drop(sess.ID)
+	msg.Ports = nil   // hint to GC; not needed beyond this point
 
 	udpEndpoint := udpEndpointFor(r)
 	if err := conn.WriteJSON(authOk{
 		Type:         "auth_ok",
 		SessionID:    sess.ID,
 		UDPEndpoint:  udpEndpoint,
-		YourPlayerID: msg.PlayerID,
+		YourPlayerID: playerID,
 	}); err != nil {
 		return
 	}
 	log.Printf("control: %s authed as session=%d player=%d (client=%s)",
-		r.RemoteAddr, sess.ID, msg.PlayerID, msg.ClientVersion)
+		r.RemoteAddr, sess.ID, playerID, msg.ClientVersion)
 
 	// Clear read deadline; rely on websocket ping/pong + topology
 	// timeout for liveness checks.
@@ -201,27 +208,36 @@ func indexLastByte(s string, b byte) int {
 	return -1
 }
 
-// checkPlayerOnline calls the L2J bridge to verify the player_id is
-// currently in L2World. Short timeout — auth is on the hot path of
-// a connect, the client is waiting.
-func checkPlayerOnline(playerID uint32) (bool, error) {
+// whoamiLookup asks the L2J bridge "which player owns the TCP socket
+// from clientIP with one of these source ports?" Returns 0 if no
+// player matches.
+func whoamiLookup(clientIP string, ports []uint16) (uint32, error) {
+	if whoamiEndpoint == "" {
+		return 0, fmt.Errorf("no whoami endpoint configured")
+	}
+	csv := make([]byte, 0, len(ports)*6)
+	for i, p := range ports {
+		if i > 0 {
+			csv = append(csv, ',')
+		}
+		csv = strconv.AppendUint(csv, uint64(p), 10)
+	}
 	client := http.Client{Timeout: 2 * time.Second}
-	url := fmt.Sprintf("%s?player_id=%d", checkEndpoint, playerID)
+	url := fmt.Sprintf("%s?ip=%s&ports=%s", whoamiEndpoint, clientIP, csv)
 	resp, err := client.Get(url)
 	if err != nil {
-		return false, err
+		return 0, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return false, fmt.Errorf("status %d: %s", resp.StatusCode, body)
+		return 0, fmt.Errorf("status %d: %s", resp.StatusCode, body)
 	}
 	var out struct {
-		Online   bool   `json:"online"`
 		PlayerID uint32 `json:"player_id"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return false, err
+		return 0, err
 	}
-	return out.Online, nil
+	return out.PlayerID, nil
 }

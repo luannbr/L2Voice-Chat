@@ -32,7 +32,7 @@ func main() {
 	wsAddr := flag.String("ws", ":17667", "TCP listen address for WebSocket control")
 	redisAddr := flag.String("redis", "", "Redis broker for L2J event subscription (host:port; empty = disabled)")
 	redisChan := flag.String("redis-chan", "l2voice:events", "Redis pub/sub channel")
-	l2jCheck := flag.String("l2j-check", "", "L2J bridge /voice/check URL for online-player validation (empty = accept any player_id; dev only)")
+	l2jWhoami := flag.String("l2j-whoami", "http://127.0.0.1:17668/voice/whoami", "L2J bridge /voice/whoami URL for TCP source-port → player_id resolution (required)")
 	echo := flag.Bool("echo", false, "echo every proximity packet back to the sender (loopback test mode)")
 	flag.Parse()
 
@@ -42,13 +42,10 @@ func main() {
 	// Shared state across UDP and WS handlers.
 	state := topology.NewState()
 
-	// Wire the L2J /voice/check endpoint (empty = stub-accept-all).
-	control.SetCheckEndpoint(*l2jCheck)
-	if *l2jCheck == "" {
-		log.Printf("control: no -l2j-check set; accepting any player_id (dev mode)")
-	} else {
-		log.Printf("control: validating player_id via %s", *l2jCheck)
-	}
+	// Wire the L2J /voice/whoami endpoint. Required — voice-service can't
+	// resolve a WS connection's player_id without it.
+	control.SetWhoamiEndpoint(*l2jWhoami)
+	log.Printf("control: resolving player_id via %s", *l2jWhoami)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

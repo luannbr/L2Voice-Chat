@@ -55,6 +55,7 @@ final class ValidateHttpServer {
             server = HttpServer.create(new InetSocketAddress(bind, port), 0);
             server.createContext("/voice/validate", this::handleValidate);
             server.createContext("/voice/check",    this::handleCheck);
+            server.createContext("/voice/whoami",   this::handleWhoami);
             server.setExecutor(null);     // single thread; load is trivial
             server.start();
             log.info("validate HTTP server listening on " + bind + ":" + port);
@@ -122,6 +123,56 @@ final class ValidateHttpServer {
             }
         }
         respond(ex, 200, "{\"online\":" + online + ",\"player_id\":" + pid + "}");
+    }
+
+    /**
+     * GET /voice/whoami?ip=X&ports=A,B,C
+     *
+     * Identity resolver. The voice-service forwards (client_ip,
+     * candidate ports) — bridge iterates L2World.getAllPlayers and
+     * matches against each player's L2GameClient remote socket. Returns
+     *   {"player_id": N}  if a match, 0 if none.
+     */
+    private void handleWhoami(HttpExchange ex) throws IOException {
+        if (!"GET".equalsIgnoreCase(ex.getRequestMethod())) {
+            respond(ex, 405, "{\"player_id\":0,\"reason\":\"method_not_allowed\"}");
+            return;
+        }
+        String q = ex.getRequestURI().getRawQuery();
+        String ip = parseQueryStr(q, "ip");
+        String portsCsv = parseQueryStr(q, "ports");
+        if (ip == null || portsCsv == null) {
+            respond(ex, 400, "{\"player_id\":0,\"reason\":\"missing_ip_or_ports\"}");
+            return;
+        }
+        java.util.Set<Integer> ports = new java.util.HashSet<>();
+        for (String s : portsCsv.split(",")) {
+            try { ports.add(Integer.parseInt(s.trim())); }
+            catch (NumberFormatException nfe) { /* skip */ }
+        }
+        int pid = 0;
+        if (worldRef != null && !ports.isEmpty()) {
+            try { pid = worldRef.findPlayerByConnection(ip, ports); }
+            catch (Throwable t) {
+                log.log(Level.WARNING, "findPlayerByConnection failed", t);
+            }
+        }
+        respond(ex, 200, "{\"player_id\":" + pid + "}");
+    }
+
+    private static String parseQueryStr(String q, String key) {
+        if (q == null) return null;
+        for (String pair : q.split("&")) {
+            int eq = pair.indexOf('=');
+            if (eq < 0) continue;
+            if (pair.substring(0, eq).equals(key)) {
+                try {
+                    return java.net.URLDecoder.decode(pair.substring(eq + 1),
+                            java.nio.charset.StandardCharsets.UTF_8);
+                } catch (Exception e) { return null; }
+            }
+        }
+        return null;
     }
 
     private static int parseQueryInt(String q, String key) {

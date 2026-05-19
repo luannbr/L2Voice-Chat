@@ -52,9 +52,12 @@ public:
                PacketCallback on_packet);
     void Stop();
 
-    // Provide auth payload (set before or after Start; if after,
-    // ws thread sends once connected).
-    void SetAuthToken(const char* token, uint32_t player_id);
+    // Provide the list of TCP local ports owned by this process. The
+    // bridge correlates these against L2GameClient remote ports to
+    // identify which player_id this WS connection represents.
+    // Replaces the old token/player_id auth — no client-side identity
+    // is trusted; everything is resolved server-side.
+    void SetClientPorts(const uint16_t* ports, size_t count);
 
     // Send a proximity audio frame. The client doesn't supply
     // position; the service knows it from L2J events.

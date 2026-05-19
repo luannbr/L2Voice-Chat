@@ -20,12 +20,27 @@
 #include <shlwapi.h>
 #pragma comment(lib, "shlwapi.lib")
 
+#include <atomic>
+#include <chrono>
 #include <thread>
 
 namespace {
 
-HMODULE     g_module = nullptr;
-std::thread g_init_thread;
+HMODULE             g_module = nullptr;
+std::thread         g_init_thread;
+std::thread         g_poll_thread;
+std::atomic<bool>   g_polling{false};
+
+void PollLoop() {
+    // 2 Hz: cheap (one GetExtendedTcpTable + memcpy) but reactive
+    // enough that the GS connection is seen within a second of the
+    // user clicking Login.
+    using namespace std::chrono;
+    while (g_polling.load(std::memory_order_acquire)) {
+        voice::OnRenderFrame();
+        std::this_thread::sleep_for(milliseconds(500));
+    }
+}
 
 void ResolveIniPath(wchar_t* out, size_t cap) {
     GetModuleFileNameW(g_module, out, (DWORD)cap);
@@ -43,29 +58,11 @@ void InitWorker() {
     if (!fromIni) {
         cfg = voice::DefaultConfig();
     }
-    // Env-var override for player_id, scoped to the launching process.
-    // Useful for testing two clients out of the same install directory:
-    //     set L2VOICE_PLAYER_ID=268499104
-    //     L2.exe
-    // Whatever is set in voice.ini is used otherwise.
-    char envBuf[64];
-    size_t envLen = 0;
-    if (getenv_s(&envLen, envBuf, sizeof(envBuf), "L2VOICE_PLAYER_ID") == 0
-            && envLen > 1) {
-        uint32_t envPid = (uint32_t)strtoul(envBuf, nullptr, 10);
-        if (envPid != 0) {
-            cfg.player_id = envPid;
-            char eb[96];
-            _snprintf_s(eb, sizeof(eb), _TRUNCATE,
-                "[l2voice] L2VOICE_PLAYER_ID env override: %u\n", envPid);
-            OutputDebugStringA(eb);
-        }
-    }
     char dbg[512];
     _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-        "[l2voice] config %s enabled=%d auto_connect=%d ws_url=%s ptt=%d player_id=%u\n",
+        "[l2voice] config %s enabled=%d auto_connect=%d ws_url=%s ptt=%d\n",
         fromIni ? "from voice.ini" : "default",
-        cfg.enabled, cfg.auto_connect, cfg.ws_url, cfg.ptt_proximity, cfg.player_id);
+        cfg.enabled, cfg.auto_connect, cfg.ws_url, cfg.ptt_proximity);
     OutputDebugStringA(dbg);
 
     if (!cfg.enabled) {
@@ -78,9 +75,14 @@ void InitWorker() {
         return;
     }
     OutputDebugStringA("[l2voice] voice::Init OK (audio devices opened, ws connecting)\n");
+
+    g_polling.store(true, std::memory_order_release);
+    g_poll_thread = std::thread(PollLoop);
 }
 
 void Shutdown() {
+    g_polling.store(false, std::memory_order_release);
+    if (g_poll_thread.joinable()) g_poll_thread.join();
     voice::Shutdown();
     if (g_init_thread.joinable()) g_init_thread.detach();
 }

@@ -26,17 +26,19 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace voice {
 
 namespace {
 
-std::string MakeAuthJson(const std::string& token, uint32_t player_id) {
-    std::string s = "{\"type\":\"auth\",\"token\":\"";
-    s.append(token);
-    s += "\",\"player_id\":";
-    s += std::to_string(player_id);
-    s += "}";
+std::string MakeAuthJson(const std::vector<uint16_t>& ports) {
+    std::string s = "{\"type\":\"auth\",\"ports\":[";
+    for (size_t i = 0; i < ports.size(); ++i) {
+        if (i) s += ',';
+        s += std::to_string(ports[i]);
+    }
+    s += "]}";
     return s;
 }
 
@@ -71,8 +73,7 @@ bool ExtractNumber(const std::string& s, const char* key, uint64_t& out) {
 struct VoiceNetwork::Impl {
     std::string ws_url;
     std::mutex auth_mu;
-    std::string token;
-    uint32_t    player_id = 0;
+    std::vector<uint16_t> client_ports;
 
     std::atomic<uint32_t> session_id{0};
     std::string udp_host;
@@ -185,11 +186,8 @@ struct VoiceNetwork::Impl {
 
     void TrySendAuth() {
         std::lock_guard<std::mutex> lk(auth_mu);
-        // Gate on player_id, not token. The voice-service validates the
-        // player against the L2J bridge — the token is currently unused
-        // (kept for forward-compat with a future cryptographic path).
-        if (player_id == 0) {
-            OutputDebugStringA("[l2voice] TrySendAuth: player_id=0, skipping\n");
+        if (client_ports.empty()) {
+            OutputDebugStringA("[l2voice] TrySendAuth: no client_ports yet\n");
             return;
         }
         if (auth_sent.load()) return;
@@ -197,11 +195,12 @@ struct VoiceNetwork::Impl {
             OutputDebugStringA("[l2voice] TrySendAuth: not connected yet\n");
             return;
         }
-        char dbg[128];
+        char dbg[256];
         _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-            "[l2voice] TrySendAuth: sending player_id=%u\n", player_id);
+            "[l2voice] TrySendAuth: sending %zu candidate ports\n",
+            client_ports.size());
         OutputDebugStringA(dbg);
-        ws.send(MakeAuthJson(token, player_id));
+        ws.send(MakeAuthJson(client_ports));
         auth_sent.store(true);
     }
 
@@ -251,11 +250,10 @@ void VoiceNetwork::Stop() {
     WSACleanup();
 }
 
-void VoiceNetwork::SetAuthToken(const char* token, uint32_t player_id) {
+void VoiceNetwork::SetClientPorts(const uint16_t* ports, size_t count) {
     {
         std::lock_guard<std::mutex> lk(impl_->auth_mu);
-        impl_->token = token ? token : "";
-        impl_->player_id = player_id;
+        impl_->client_ports.assign(ports, ports + count);
         impl_->auth_sent.store(false);
     }
     impl_->TrySendAuth();
