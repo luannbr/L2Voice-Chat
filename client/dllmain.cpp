@@ -68,3 +68,22 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID /*reserved*/) {
     }
     return TRUE;
 }
+
+// ---- public exports -------------------------------------------------
+//
+// IAT-injection tools need at least one named export so they can write
+// an IMPORT_DESCRIPTOR pointing at l2voice.dll!<name>. The body can be
+// empty — voice::Init() already runs from DllMain on DLL_PROCESS_ATTACH.
+//
+// L2Voice_Init   : matches the l2ui.dll convention (l2ui exports L2UI_Init).
+// Tools that prefer the legacy "Init" name also find this DLL.
+
+extern "C" __declspec(dllexport) void L2Voice_Init() {
+    // No-op. DllMain does the real work; this export exists so the
+    // IAT-binder has a symbol to anchor on.
+}
+
+extern "C" __declspec(dllexport) void Init() {
+    // Alias for tools that expect the generic "Init" name.
+}
+
