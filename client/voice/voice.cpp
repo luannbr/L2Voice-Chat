@@ -10,6 +10,7 @@
 #include "voice.h"
 #include "audio_io.h"
 #include "opus_codec.h"
+#include "user_hook.h"
 #include "voice_network.h"
 
 #include <windows.h>
@@ -102,7 +103,7 @@ Config DefaultConfig() {
     c.playback_device[0] = 0;
     c.min_dist_cm   = 500.0f;
     c.max_dist_cm   = 2500.0f;
-    c.ptt_proximity = 'V';
+    c.ptt_proximity = 'H';  // V conflicts with the client's inventory hotkey
     c.ptt_party     = 'B';
     c.ptt_clan      = 'N';
     c.ptt_ally      = 'M';
@@ -159,17 +160,20 @@ bool Init(const Config& cfg) {
         g_mod.net.Start(cfg.ws_url,
                         [](uint32_t /*sid*/, const char*, uint16_t) {},
                         &OnIncomingPacket);
-        // Send auth with the configured player_id. The voice-service
-        // validates via the L2J bridge /voice/check — no token needed
-        // when stub-auth is wired against the bridge. If player_id is
-        // 0 (default), the WS auth still goes through but the bridge
-        // will reject it as not-online; useful to confirm the path.
-        //
-        // TEMP — task #29: when g_localUser->ObjectId is mapped, the
-        // DLL will read player_id from memory and ignore the ini.
+        // Pre-arm with whatever ini/env gave us (fallback path). If the
+        // engine.dll hook discovers a real ObjectId later, the callback
+        // below overwrites it before the next auth attempt.
         if (cfg.player_id != 0) {
             g_mod.net.SetAuthToken("", cfg.player_id);
         }
+
+        // Try to install the engine.dll hook for auto-detection.
+        // Callback overrides the configured player_id once the local
+        // player's User::SetName fires.
+        InstallUserHook([](uint32_t pid) {
+            g_mod.cfg.player_id = pid;
+            g_mod.net.SetAuthToken("", pid);
+        });
     }
 
     g_mod.running.store(true);
@@ -178,6 +182,7 @@ bool Init(const Config& cfg) {
 
 void Shutdown() {
     if (!g_mod.running.exchange(false)) return;
+    UninstallUserHook();
     g_mod.capture.Stop();
     g_mod.net.Stop();
     g_mod.playback.Stop();

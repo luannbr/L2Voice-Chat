@@ -56,10 +56,28 @@ final class PositionPoller {
             log.log(Level.SEVERE, "could not bind L2World via reflection; poller disabled", e);
             return;
         }
+        log.info("PositionPoller started at " + hz + " Hz (delta " + minDelta + "cm)");
+        long lastStats = 0;
+        int publishedSinceStats = 0;
         while (!stopping.get()) {
             long t0 = System.currentTimeMillis();
             try {
-                world.forEachPlayer(this::tickPlayer);
+                int[] cnt = {0, 0};   // seen, published
+                world.forEachPlayer((oid, x, y, z, inst) -> {
+                    cnt[0]++;
+                    int before = publishedThisTick;
+                    tickPlayer(oid, x, y, z, inst);
+                    if (publishedThisTick > before) cnt[1]++;
+                });
+                publishedSinceStats += cnt[1];
+                // Stats log every ~30 s so we can see PositionPoller is alive.
+                if (t0 - lastStats > 30_000) {
+                    log.info("PositionPoller: " + cnt[0] + " players visible, "
+                            + publishedSinceStats + " position events in last "
+                            + ((t0 - lastStats) / 1000) + "s");
+                    lastStats = t0;
+                    publishedSinceStats = 0;
+                }
             } catch (Exception e) {
                 log.log(Level.WARNING, "position poll iteration failed", e);
             }
@@ -71,8 +89,13 @@ final class PositionPoller {
         }
     }
 
+    private int publishedThisTick = 0;
+
     private void tickPlayer(int objectId, int x, int y, int z, int instanceId) {
         int[] prev = last.get(objectId);
+        // First sight of a player → always publish (voice-service needs a
+        // position before it can route any proximity audio for them).
+        // After that, throttle by minDelta.
         if (prev != null && Math.abs(prev[0] - x) < minDelta
                          && Math.abs(prev[1] - y) < minDelta
                          && Math.abs(prev[2] - z) < minDelta
@@ -85,6 +108,7 @@ final class PositionPoller {
             prev[0] = x; prev[1] = y; prev[2] = z; prev[3] = instanceId;
         }
         pub.publishPosition(objectId, x, y, z, instanceId);
+        publishedThisTick++;
     }
 
 }

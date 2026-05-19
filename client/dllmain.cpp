@@ -43,11 +43,29 @@ void InitWorker() {
     if (!fromIni) {
         cfg = voice::DefaultConfig();
     }
+    // Env-var override for player_id, scoped to the launching process.
+    // Useful for testing two clients out of the same install directory:
+    //     set L2VOICE_PLAYER_ID=268499104
+    //     L2.exe
+    // Whatever is set in voice.ini is used otherwise.
+    char envBuf[64];
+    size_t envLen = 0;
+    if (getenv_s(&envLen, envBuf, sizeof(envBuf), "L2VOICE_PLAYER_ID") == 0
+            && envLen > 1) {
+        uint32_t envPid = (uint32_t)strtoul(envBuf, nullptr, 10);
+        if (envPid != 0) {
+            cfg.player_id = envPid;
+            char eb[96];
+            _snprintf_s(eb, sizeof(eb), _TRUNCATE,
+                "[l2voice] L2VOICE_PLAYER_ID env override: %u\n", envPid);
+            OutputDebugStringA(eb);
+        }
+    }
     char dbg[512];
     _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-        "[l2voice] config %s enabled=%d auto_connect=%d ws_url=%s ptt=%d\n",
+        "[l2voice] config %s enabled=%d auto_connect=%d ws_url=%s ptt=%d player_id=%u\n",
         fromIni ? "from voice.ini" : "default",
-        cfg.enabled, cfg.auto_connect, cfg.ws_url, cfg.ptt_proximity);
+        cfg.enabled, cfg.auto_connect, cfg.ws_url, cfg.ptt_proximity, cfg.player_id);
     OutputDebugStringA(dbg);
 
     if (!cfg.enabled) {

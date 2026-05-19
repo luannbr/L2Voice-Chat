@@ -188,9 +188,19 @@ struct VoiceNetwork::Impl {
         // Gate on player_id, not token. The voice-service validates the
         // player against the L2J bridge — the token is currently unused
         // (kept for forward-compat with a future cryptographic path).
-        if (player_id == 0) return;
+        if (player_id == 0) {
+            OutputDebugStringA("[l2voice] TrySendAuth: player_id=0, skipping\n");
+            return;
+        }
         if (auth_sent.load()) return;
-        if (!connected.load()) return;
+        if (!connected.load()) {
+            OutputDebugStringA("[l2voice] TrySendAuth: not connected yet\n");
+            return;
+        }
+        char dbg[128];
+        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+            "[l2voice] TrySendAuth: sending player_id=%u\n", player_id);
+        OutputDebugStringA(dbg);
         ws.send(MakeAuthJson(token, player_id));
         auth_sent.store(true);
     }

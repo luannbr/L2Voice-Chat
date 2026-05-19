@@ -48,6 +48,15 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(miniaudio)
 
+# ---- MinHook (BSD-2-Clause) -----------------------------------------
+FetchContent_Declare(
+    minhook
+    GIT_REPOSITORY https://github.com/TsudaKageyu/minhook.git
+    GIT_TAG v1.3.4
+    GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(minhook)
+
 # ---- IXWebSocket (MIT) ----------------------------------------------
 FetchContent_Declare(
     ixwebsocket
@@ -68,6 +77,7 @@ add_library(l2voice SHARED
     voice/audio_io.cpp
     voice/opus_codec.cpp
     voice/voice_network.cpp
+    voice/user_hook.cpp
 )
 
 target_include_directories(l2voice PRIVATE
@@ -79,6 +89,7 @@ target_include_directories(l2voice PRIVATE
 target_link_libraries(l2voice PRIVATE
     opus
     ixwebsocket
+    minhook
     ws2_32
     winmm
 )
