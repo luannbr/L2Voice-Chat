@@ -1,18 +1,19 @@
-// Package audio implements the UDP audio router. One goroutine reads
-// packets from the socket, parses the header, and forwards the
-// payload to the appropriate set of receivers based on channel:
+// Package audio implements the UDP audio router (protocol rev 2).
 //
-//   channel=0 proximity: spatial lookup in topology, forward to all
-//                        sessions within MaxAudibleRange of the sender
-//                        in the same instance, ONLY when the sender is
-//                        a registered session (via WS auth).
-//   channel=1..3 party/clan/ally: deferred (not implemented in MVP).
-//   channel=5 keepalive: noop, just refreshes LastSeen.
-//   channel=6 ping_req: echo back as channel=7 to the same sender.
+// Ingress packet shape (8-byte header, no position):
+//     version(1) | channel(1) | seq_lo(2) | session_id(4) | opus...
+//
+// Egress packet shape:
+//   - proximity (channel 0):  8-byte header | gain(1) | pan(1) | opus
+//   - other channels:         8-byte header | opus
+//
+// Spatial state (X/Y/Z, InstanceID) is populated by the L2J bridge
+// over Redis pub/sub — see internal/social. The router consults the
+// topology state for every routed packet and computes gain+pan per
+// receiver before sendto.
 //
 // Packets from un-registered senders (unknown session_id) are
-// dropped silently; logged on a 10-second sampling cadence to avoid
-// log floods.
+// dropped silently; a 10-second log sample reports the rate.
 package audio
 
 import (
@@ -28,13 +29,13 @@ import (
 )
 
 const (
-	// MaxAudibleRange is the cutoff for proximity routing. Beyond
-	// this distance the speaker is inaudible regardless of attenuation
-	// curve. Stays comfortably above the 25m fade-to-zero in the
-	// protocol so the client always has a packet to ramp out with.
-	MaxAudibleRange float32 = 3000.0 // 30 m in L2 cm units
+	// Spatial parameters (could be made per-receiver later).
+	MinDistance float32 = 500.0  //  5 m in L2 cm — full volume below
+	MaxDistance float32 = 2500.0 // 25 m in L2 cm — silent at/above
+	// PanHalfWidth: how far off-axis horizontally produces full L/R pan.
+	PanHalfWidth float32 = 1500.0
 
-	maxPacketSize = 1500 // safely below typical Ethernet MTU
+	maxPacketSize = 1500
 )
 
 const (
@@ -51,9 +52,8 @@ const (
 // Config bundles router-mode flags.
 type Config struct {
 	// Echo: every proximity packet is bounced back to its sender
-	// (in addition to normal spatial routing — used for loopback
-	// validation of audio capture/codec/UDP path before there are
-	// two clients to test with).
+	// with gain=255 / pan=0 (in addition to normal spatial routing).
+	// Useful for loopback validation before there are two clients.
 	Echo bool
 }
 
@@ -70,7 +70,6 @@ func Serve(ctx context.Context, udpAddr string, state *topology.State, cfg Confi
 	defer conn.Close()
 	log.Printf("audio: listening on %s", conn.LocalAddr())
 
-	// Close on shutdown so the blocking ReadFromUDP returns.
 	go func() {
 		<-ctx.Done()
 		conn.SetReadDeadline(time.Unix(1, 0))
@@ -91,12 +90,11 @@ func Serve(ctx context.Context, udpAddr string, state *topology.State, cfg Confi
 			continue
 		}
 		if n < 8 {
-			continue // smaller than common header
+			continue
 		}
-		// Parse common header.
 		version := buf[0]
 		channel := buf[1]
-		// seqLo := binary.LittleEndian.Uint16(buf[2:4])
+		seqLo := binary.LittleEndian.Uint16(buf[2:4])
 		sid := binary.LittleEndian.Uint32(buf[4:8])
 		if version != 1 {
 			continue
@@ -113,52 +111,88 @@ func Serve(ctx context.Context, udpAddr string, state *topology.State, cfg Confi
 			}
 			continue
 		}
-		// First packet (or rebind): record source addr.
 		if sess.UDPAddr == nil || sess.UDPAddr.String() != from.String() {
 			state.RememberUDP(sess, from)
 		}
 
 		switch channel {
 		case chProximity:
-			routeProximity(buf[:n], sess, state, conn)
-			if cfg.Echo {
-				// Echo back to sender for loopback testing.
-				_, _ = conn.WriteToUDP(buf[:n], from)
-			}
+			routeProximity(seqLo, sid, buf[8:n], sess, state, conn, cfg)
 		case chKeepalive:
-			// noop, RememberUDP already touched LastSeen via RememberUDP path
+			// LastSeen already touched on first packet via RememberUDP path.
 		case chPingReq:
-			// echo back as resp
-			out := make([]byte, n)
-			copy(out, buf[:n])
+			// Reflect as ping_resp with same seq.
+			var out [8]byte
+			out[0] = 1
 			out[1] = chPingResp
-			conn.WriteToUDP(out, from)
+			binary.LittleEndian.PutUint16(out[2:4], seqLo)
+			binary.LittleEndian.PutUint32(out[4:8], sid)
+			conn.WriteToUDP(out[:], from)
 		default:
-			// party/clan/ally/siege not implemented in MVP — drop quietly
+			// party/clan/ally/siege not implemented in MVP — drop quietly.
 		}
 	}
 }
 
-// routeProximity parses the position from a channel-0 packet, updates
-// the speaker's position in topology, then forwards the original
-// packet bytes to every nearby session in the same instance.
-func routeProximity(pkt []byte, speaker *topology.Session,
-	state *topology.State, conn *net.UDPConn) {
+// routeProximity forwards a proximity opus payload to every nearby
+// session in the same instance, stamping a per-receiver gain+pan.
+func routeProximity(seqLo uint16, srcSID uint32, opus []byte,
+	speaker *topology.Session, state *topology.State,
+	conn *net.UDPConn, cfg Config) {
 
-	if len(pkt) < 28 {
-		return // truncated proximity packet
+	if len(opus) == 0 {
+		return
 	}
-	x := math.Float32frombits(binary.LittleEndian.Uint32(pkt[8:12]))
-	y := math.Float32frombits(binary.LittleEndian.Uint32(pkt[12:16]))
-	z := math.Float32frombits(binary.LittleEndian.Uint32(pkt[16:20]))
-	inst := binary.LittleEndian.Uint32(pkt[20:24])
-	state.UpdatePosition(speaker, x, y, z, inst)
 
-	for _, recv := range state.ProximityNeighbors(speaker, MaxAudibleRange) {
-		if recv.UDPAddr == nil {
+	now := time.Now()
+	speakerHasPos := speaker.PositionKnown(now)
+
+	// Egress buffer (header + spatial + opus). Reused per send.
+	out := make([]byte, 10+len(opus))
+	out[0] = 1                 // version
+	out[1] = chProximity       // channel
+	binary.LittleEndian.PutUint16(out[2:4], seqLo)
+	binary.LittleEndian.PutUint32(out[4:8], srcSID)
+	copy(out[10:], opus)
+
+	// Optional self-echo (no spatial info — gain=255, pan=0).
+	if cfg.Echo && speaker.UDPAddr != nil {
+		out[8] = 255
+		out[9] = 0
+		_, _ = conn.WriteToUDP(out, speaker.UDPAddr)
+	}
+
+	// Without speaker position we can't compute spatial routing.
+	// (Service can still deliver in echo mode above for loopback.)
+	if !speakerHasPos {
+		return
+	}
+
+	for _, recv := range state.ProximityNeighbors(speaker, MaxDistance) {
+		if recv.UDPAddr == nil || !recv.PositionKnown(now) {
 			continue
 		}
-		_, _ = conn.WriteToUDP(pkt, recv.UDPAddr)
+		dx := speaker.X - recv.X
+		dy := speaker.Y - recv.Y
+		dz := speaker.Z - recv.Z
+		dist := float32(math.Sqrt(float64(dx*dx + dy*dy + dz*dz)))
+		gainF := float32(1.0)
+		if dist > MinDistance {
+			gainF = 1.0 - (dist-MinDistance)/(MaxDistance-MinDistance)
+		}
+		if gainF <= 0 {
+			continue
+		}
+		// Pan: horizontal X delta as a stand-in until we have camera yaw.
+		panF := dx / PanHalfWidth
+		if panF < -1 {
+			panF = -1
+		} else if panF > 1 {
+			panF = 1
+		}
+
+		out[8] = uint8(gainF*255 + 0.5)
+		out[9] = byte(int8(panF*127 + 0.5))
+		_, _ = conn.WriteToUDP(out, recv.UDPAddr)
 	}
 }
-

@@ -23,12 +23,15 @@ import (
 
 	"github.com/luannbr/l2voice/voice-service/internal/audio"
 	"github.com/luannbr/l2voice/voice-service/internal/control"
+	"github.com/luannbr/l2voice/voice-service/internal/social"
 	"github.com/luannbr/l2voice/voice-service/internal/topology"
 )
 
 func main() {
 	udpAddr := flag.String("udp", ":17666", "UDP listen address for audio")
 	wsAddr := flag.String("ws", ":17667", "TCP listen address for WebSocket control")
+	redisAddr := flag.String("redis", "", "Redis broker for L2J event subscription (host:port; empty = disabled)")
+	redisChan := flag.String("redis-chan", "l2voice:events", "Redis pub/sub channel")
 	echo := flag.Bool("echo", false, "echo every proximity packet back to the sender (loopback test mode)")
 	flag.Parse()
 
@@ -55,6 +58,19 @@ func main() {
 			log.Fatalf("control.Serve: %v", err)
 		}
 	}()
+
+	// Redis subscriber (optional — without it, no spatial routing).
+	if *redisAddr != "" {
+		go func() {
+			if err := social.Subscribe(ctx,
+				social.Config{Addr: *redisAddr, Channel: *redisChan},
+				state); err != nil {
+				log.Printf("social.Subscribe exited: %v", err)
+			}
+		}()
+	} else {
+		log.Printf("social: no -redis set; spatial routing disabled (echo mode still works)")
+	}
 
 	// Block until SIGINT/SIGTERM.
 	sigs := make(chan os.Signal, 1)

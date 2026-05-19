@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  l2j-bridge — Java module that lives inside the l2emuproject Essence
+  GameServer and publishes player-state events to the voice-service
+  over Redis pub/sub. Also serves the /voice/validate HTTP endpoint.
+
+  Build:   mvn -f l2j-bridge/pom.xml package
+  Output:  target/l2voice-bridge-0.1.0.jar
+  Deploy:  drop the jar into the GS `lib/` directory, then call
+           VoiceBridge.start(properties) once from the GS startup
+           sequence (see l2j-bridge/README.md for the patch).
+
+  Requires JDK 17 (matches the Essence 542 GS toolchain).
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+    <modelVersion>4.0.0</modelVersion>
+    <groupId>com.luannbr.l2voice</groupId>
+    <artifactId>l2voice-bridge</artifactId>
+    <version>0.1.0</version>
+    <packaging>jar</packaging>
+
+    <properties>
+        <maven.compiler.source>17</maven.compiler.source>
+        <maven.compiler.target>17</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+        <!--
+          Adjust this to point at the actual L2J GS classes/jar in your
+          environment. The Ant build puts the jar at:
+            ../../542_2026/Source-GS_SR-542-main/build/gameserver/l2emu-gs.jar
+          The bridge does NOT bundle L2J; it imports L2J types at
+          compile-time and runs inside the GS JVM at runtime.
+        -->
+        <l2j.gs.jar>${project.basedir}/../../542_2026/Source-GS_SR-542-main/build/gameserver/l2emu-gs.jar</l2j.gs.jar>
+    </properties>
+
+    <dependencies>
+        <!-- Redis client. Jedis is MIT, smallest mature client. -->
+        <dependency>
+            <groupId>redis.clients</groupId>
+            <artifactId>jedis</artifactId>
+            <version>5.1.2</version>
+        </dependency>
+
+        <!-- L2J GameServer (supplied at runtime; compile-only here). -->
+        <dependency>
+            <groupId>net.l2emuproject</groupId>
+            <artifactId>gameserver</artifactId>
+            <version>542</version>
+            <scope>system</scope>
+            <systemPath>${l2j.gs.jar}</systemPath>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <finalName>l2voice-bridge-${project.version}</finalName>
+        <plugins>
+            <plugin>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.5.1</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals><goal>shade</goal></goals>
+                        <configuration>
+                            <createDependencyReducedPom>false</createDependencyReducedPom>
+                            <minimizeJar>true</minimizeJar>
+                            <artifactSet>
+                                <excludes>
+                                    <exclude>net.l2emuproject:gameserver</exclude>
+                                </excludes>
+                            </artifactSet>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>

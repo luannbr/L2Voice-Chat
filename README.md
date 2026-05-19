@@ -64,7 +64,7 @@ Voice_System/
 | 1     | Monorepo structure + protocol doc | ✅ approved |
 | 2     | Proximity-only voice module in DLL | in progress |
 | 3     | Go voice-service for proximity | in progress |
-| 4     | L2J bridge | pending |
+| 4     | L2J bridge (skeleton + Redis pub/sub + HTTP validate) | in progress |
 | 5     | Special cases (Olympiad/siege/multibox/death) | pending |
 
 Scope reduced to **proximity only** for the first end-to-end demo; party/clan/ally come after proximity works.

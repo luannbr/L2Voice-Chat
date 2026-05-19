@@ -16,9 +16,16 @@ type Session struct {
 	ID         uint32       // server-allocated, 1-based
 	PlayerID   uint32       // L2 character object id (from auth)
 	UDPAddr    *net.UDPAddr // resolved from first audio packet, mutable after NAT rebind
-	X, Y, Z    float32      // latest position reported on a proximity packet
+	X, Y, Z    float32      // latest position pushed by the L2J bridge
 	InstanceID uint32       // 0 = main world
-	LastSeen   time.Time
+	PosTime    time.Time    // when X/Y/Z was last updated by L2J event
+	LastSeen   time.Time    // last UDP/WS activity
+}
+
+// PositionKnown reports whether we have a recent (<2 s) position from L2J.
+// Used by the proximity router to decide whether to route at all.
+func (sess *Session) PositionKnown(now time.Time) bool {
+	return !sess.PosTime.IsZero() && now.Sub(sess.PosTime) < 2*time.Second
 }
 
 // State is the global session table.
@@ -76,14 +83,25 @@ func (s *State) RememberUDP(sess *Session, addr *net.UDPAddr) {
 	s.mu.Unlock()
 }
 
-// UpdatePosition records the latest position from a proximity packet.
-// Called every audio frame (~50 Hz per active speaker).
+// UpdatePosition records a position update from the L2J bridge (or
+// any other authoritative source). Called at L2J's broadcast cadence
+// (~5 Hz while a player moves, plus one final on stop).
 func (s *State) UpdatePosition(sess *Session, x, y, z float32, instance uint32) {
+	now := time.Now()
 	s.mu.Lock()
 	sess.X, sess.Y, sess.Z = x, y, z
 	sess.InstanceID = instance
-	sess.LastSeen = time.Now()
+	sess.PosTime = now
 	s.mu.Unlock()
+}
+
+// LookupByPlayer returns the session for an L2 character object id
+// (or nil if no session is currently registered for that player).
+// Used by the Redis subscriber to route L2J events to the right session.
+func (s *State) LookupByPlayer(playerID uint32) *Session {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.byPlayer[playerID]
 }
 
 // ProximityNeighbors returns all OTHER sessions within `radius` cm of

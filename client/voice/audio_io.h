@@ -1,15 +1,13 @@
-// audio_io.h — thin C++ wrapper around miniaudio for capture and
-// playback. Hides the miniaudio types so callers only see std/cstdint.
+// audio_io.h — miniaudio capture + playback wrappers.
 //
-// Capture: WASAPI input device, 48kHz mono, fixed 20ms frames
-// (960 samples). On each frame the on_frame_cb fires on the
-// miniaudio callback thread; keep work minimal there (just push to
-// a ring buffer or encode + send).
+// Capture: WASAPI input, 48 kHz mono, fixed 20 ms frames (960
+// samples). on_frame_cb fires on miniaudio's audio thread; keep work
+// minimal there (encode + UDP send is fine).
 //
-// Playback: WASAPI output device, 48kHz stereo (so positional pan
-// works). The mixer is fed by Enqueue() per source; the audio
-// thread pulls and mixes with per-source 3D attenuation +
-// equal-power panning.
+// Playback: WASAPI output, 48 kHz stereo. The mixer is fed by
+// Enqueue() per source. Gain and pan are supplied by the caller
+// (service-computed in protocol rev 2), so the playback path does
+// not do any spatial math — just gain + equal-power pan.
 
 #pragma once
 
@@ -28,7 +26,6 @@ public:
     AudioCapture();
     ~AudioCapture();
 
-    // device_name = "" → default input device. Returns false on init failure.
     bool Start(const char* device_name, CaptureCallback cb);
     void Stop();
     bool IsRunning() const;
@@ -38,41 +35,30 @@ private:
     Impl* impl_;
 };
 
-// ---- Playback / 3D mixer --------------------------------------------
+// ---- Playback / mixer -----------------------------------------------
 
 class AudioPlayback {
 public:
     AudioPlayback();
     ~AudioPlayback();
 
-    // device_name = "" → default output device.
     bool Start(const char* device_name);
     void Stop();
     bool IsRunning() const;
 
-    // Configuration for the distance attenuation curve (per source).
-    // Linear from full volume at <= min_dist to 0 at >= max_dist.
-    void SetAttenuation(float min_dist, float max_dist);
-
     // Enqueue a decoded PCM frame from a remote speaker. Thread-safe.
-    // src_id identifies the speaker (=session_id from server);
-    // listener-relative coordinates passed (we already computed delta
-    // before calling).
     //
-    // delta_x/y/z are the speaker's position MINUS the listener's,
-    // in the L2 unit (cm). distance_attenuation is precomputed by
-    // the caller from the same delta (avoids recomputation).
+    //   src_id : speaker id (= src_session_id from packet)
+    //   gain   : 0..1 multiplier (already includes distance falloff)
+    //   pan    : -1..+1 (negative=left, positive=right, 0=center)
     void Enqueue(uint32_t src_id,
                  const int16_t* mono_pcm, uint32_t samples,
-                 float delta_x, float delta_y, float delta_z,
-                 float volume);
+                 float gain, float pan);
 
-    // Drop a source (e.g. session disconnected). Frees its decoder
-    // and mixer slot.
+    // Drop a source (e.g. session disconnected).
     void DropSource(uint32_t src_id);
 
-    // Returns the number of sources that mixed audio in the last
-    // 100ms — for the HUD "X speakers" badge.
+    // Number of sources that mixed audio in the last 100 ms.
     int ActiveSpeakers();
 
 private:

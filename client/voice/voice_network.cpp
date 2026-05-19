@@ -2,15 +2,15 @@
 //
 // WS thread: connects to ws_url, sends an "auth" JSON envelope when
 // it has a token, parses "auth_ok" to learn (session_id, udp_host,
-// udp_port). Re-connects with exponential backoff (1s → 30s).
+// udp_port). Re-connects with exponential backoff (built into
+// IXWebSocket).
 //
 // UDP thread: blocks on recvfrom; for each packet, parses the
-// common header + (channel == proximity ? the 28-byte extended
-// header) and fires PacketCallback.
+// 8-byte common header and (channel == proximity ? the 2-byte
+// gain+pan suffix) and fires PacketCallback.
 //
-// Send is fire-and-forget; we don't track loss or RTT here. The
-// service echoes ping_req as ping_resp (channel 6→7); RTT measurement
-// can be wired later via a small map of seq→t_send.
+// Send is fire-and-forget. RTT measurement via ping_req/ping_resp
+// can be wired later via a small map of seq → t_send.
 
 #include "voice_network.h"
 
@@ -22,7 +22,6 @@
 #include <ixwebsocket/IXNetSystem.h>
 
 #include <atomic>
-#include <chrono>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -32,9 +31,6 @@ namespace voice {
 
 namespace {
 
-// Tiny JSON formatter — we emit only one shape (auth) and parse only
-// one shape (auth_ok), so we keep this inline rather than adding a
-// JSON dep. If the message vocabulary grows, swap in nlohmann/json.
 std::string MakeAuthJson(const std::string& token, uint32_t player_id) {
     std::string s = "{\"type\":\"auth\",\"token\":\"";
     s.append(token);
@@ -73,24 +69,20 @@ bool ExtractNumber(const std::string& s, const char* key, uint64_t& out) {
 }  // namespace
 
 struct VoiceNetwork::Impl {
-    // Configuration / state
     std::string ws_url;
     std::mutex auth_mu;
     std::string token;
     uint32_t    player_id = 0;
 
-    // Resolved by auth_ok
     std::atomic<uint32_t> session_id{0};
     std::string udp_host;
     std::atomic<uint16_t> udp_port{0};
     std::atomic<bool> connected{false};
     std::atomic<bool> auth_sent{false};
 
-    // Callbacks
     AuthOkCallback on_auth;
     PacketCallback on_packet;
 
-    // Sockets / threads
     SOCKET udp_sock = INVALID_SOCKET;
     sockaddr_in udp_dest{};
     ix::WebSocket ws;
@@ -105,8 +97,6 @@ struct VoiceNetwork::Impl {
     bool OpenUdp() {
         udp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (udp_sock == INVALID_SOCKET) return false;
-        // Non-blocking recv with a 100ms timeout, so we can poll
-        // shutdown.
         DWORD tv = 100;
         setsockopt(udp_sock, SOL_SOCKET, SO_RCVTIMEO,
                    (const char*)&tv, sizeof(tv));
@@ -118,7 +108,6 @@ struct VoiceNetwork::Impl {
         udp_dest.sin_family = AF_INET;
         udp_dest.sin_port = htons(port);
         inet_pton(AF_INET, host.c_str(), &udp_dest.sin_addr);
-        // Also bind to ephemeral local port so we can receive replies.
         sockaddr_in local{};
         local.sin_family = AF_INET;
         local.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -137,29 +126,34 @@ struct VoiceNetwork::Impl {
             uint8_t ver = buf[0];
             if (ver != 1) continue;
             uint8_t channel = buf[1];
-            uint16_t seq_lo = (uint16_t)buf[2] | ((uint16_t)buf[3] << 8);
-            uint32_t src    = (uint32_t)buf[4]       | ((uint32_t)buf[5] << 8)
-                            | ((uint32_t)buf[6] << 16) | ((uint32_t)buf[7] << 24);
+            uint16_t seq = (uint16_t)buf[2] | ((uint16_t)buf[3] << 8);
+            uint32_t src = (uint32_t)buf[4]
+                         | ((uint32_t)buf[5] << 8)
+                         | ((uint32_t)buf[6] << 16)
+                         | ((uint32_t)buf[7] << 24);
 
-            if (channel == 0) {  // proximity
-                if (n < 28) continue;
-                float x, y, z;
-                uint32_t inst;
-                std::memcpy(&x,    buf + 8,  4);
-                std::memcpy(&y,    buf + 12, 4);
-                std::memcpy(&z,    buf + 16, 4);
-                std::memcpy(&inst, buf + 20, 4);
-                uint16_t opus_len = (uint16_t)buf[24] | ((uint16_t)buf[25] << 8);
-                // bytes 26..27 are reserved
-                if (28 + opus_len > n) continue;
-                if (on_packet) {
-                    on_packet(channel, src, seq_lo, x, y, z, inst,
-                              buf + 28, opus_len);
-                }
-            } else if (channel == 7) {  // ping_resp; ignore for now
+            const uint8_t* opus = nullptr;
+            uint16_t opus_len = 0;
+            uint8_t gain = 255;
+            int8_t  pan  = 0;
+
+            if (channel == 0) {                 // proximity, 10-byte header
+                if (n < 10) continue;
+                gain = buf[8];
+                pan  = (int8_t)buf[9];
+                opus = buf + 10;
+                opus_len = (uint16_t)(n - 10);
+            } else if (channel >= 1 && channel <= 4) {  // party/clan/ally/siege
+                opus = buf + 8;
+                opus_len = (uint16_t)(n - 8);
+            } else if (channel == 7) {          // ping_resp
                 continue;
             } else {
-                // Non-proximity audio not implemented client-side yet.
+                continue;
+            }
+
+            if (on_packet) {
+                on_packet(channel, src, seq, gain, pan, opus, opus_len);
             }
         }
     }
@@ -191,7 +185,7 @@ struct VoiceNetwork::Impl {
 
     void TrySendAuth() {
         std::lock_guard<std::mutex> lk(auth_mu);
-        if (token.empty()) return;        // wait until token provided
+        if (token.empty()) return;
         if (auth_sent.load()) return;
         if (!connected.load()) return;
         ws.send(MakeAuthJson(token, player_id));
@@ -199,7 +193,6 @@ struct VoiceNetwork::Impl {
     }
 
     void HandleWsMessage(const std::string& s) {
-        // Only auth_ok is interesting in MVP.
         if (s.find("\"auth_ok\"") == std::string::npos) return;
         uint64_t sid_u = 0;
         if (!ExtractNumber(s, "session_id", sid_u)) return;
@@ -255,29 +248,20 @@ void VoiceNetwork::SetAuthToken(const char* token, uint32_t player_id) {
     impl_->TrySendAuth();
 }
 
-void VoiceNetwork::SendProximityFrame(uint32_t seq,
-                                      float x, float y, float z,
-                                      uint32_t instance_id,
+void VoiceNetwork::SendProximityFrame(uint16_t seq,
                                       const uint8_t* opus, int opus_len) {
-    if (impl_->udp_port.load() == 0) return;       // not authed yet
+    if (impl_->udp_port.load() == 0) return;
     if (opus_len <= 0 || opus_len > 1024) return;
 
-    uint8_t pkt[1500];
-    pkt[0] = 1;                                    // version
-    pkt[1] = 0;                                    // channel = proximity
+    uint8_t pkt[1100];
+    pkt[0] = 1;                       // version
+    pkt[1] = 0;                       // channel = proximity
     pkt[2] = (uint8_t)(seq & 0xFF);
     pkt[3] = (uint8_t)((seq >> 8) & 0xFF);
     uint32_t sid = impl_->session_id.load();
     std::memcpy(pkt + 4, &sid, 4);
-    std::memcpy(pkt + 8,  &x,  4);
-    std::memcpy(pkt + 12, &y,  4);
-    std::memcpy(pkt + 16, &z,  4);
-    std::memcpy(pkt + 20, &instance_id, 4);
-    pkt[24] = (uint8_t)(opus_len & 0xFF);
-    pkt[25] = (uint8_t)((opus_len >> 8) & 0xFF);
-    pkt[26] = 0; pkt[27] = 0;
-    std::memcpy(pkt + 28, opus, opus_len);
-    int total = 28 + opus_len;
+    std::memcpy(pkt + 8, opus, opus_len);
+    int total = 8 + opus_len;
     sendto(impl_->udp_sock, (const char*)pkt, total, 0,
            (sockaddr*)&impl_->udp_dest, sizeof(impl_->udp_dest));
 }

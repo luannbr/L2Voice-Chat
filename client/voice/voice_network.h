@@ -7,11 +7,17 @@
 //              exponential backoff on disconnect.
 //
 //   udpThread: blocks on recvfrom; for each packet, dispatches to
-//              VoicePipeline::OnRecv which decodes + enqueues into
-//              the playback mixer.
+//              the PacketCallback which decodes + enqueues into the
+//              playback mixer.
 //
 // Sending is synchronous from the capture callback (encode then
 // sendto) — UDP send is non-blocking and bounded latency.
+//
+// Wire format note (protocol rev 2): the client does NOT carry
+// position. The service computes gain+pan from server-side L2J
+// positions and stamps them into the egress packet. This header
+// is therefore tiny on send (8 bytes) and 10 bytes on receive for
+// the proximity channel.
 
 #pragma once
 
@@ -25,16 +31,14 @@ using AuthOkCallback = std::function<void(uint32_t session_id,
                                           const char* udp_host,
                                           uint16_t udp_port)>;
 
-// Callback fired for each incoming audio packet. Buffer ownership is
-// caller's; the callback should copy or finish work before returning.
-//
-// channel matches the protocol enum. For proximity, x/y/z/instance
-// are the sender's position. For other channels they're zero.
-using PacketCallback = std::function<void(uint8_t channel,
+// Callback fired for each incoming audio packet. The service has
+// already computed gain and pan for the proximity channel; non-
+// proximity channels arrive with gain=255 / pan=0.
+using PacketCallback = std::function<void(uint8_t  channel,
                                           uint32_t src_session_id,
-                                          uint32_t seq,
-                                          float x, float y, float z,
-                                          uint32_t instance_id,
+                                          uint16_t seq,
+                                          uint8_t  gain,    // 0..255
+                                          int8_t   pan,     // -127..+127
                                           const uint8_t* opus_payload,
                                           uint16_t opus_len)>;
 
@@ -52,11 +56,9 @@ public:
     // ws thread sends once connected).
     void SetAuthToken(const char* token, uint32_t player_id);
 
-    // Send a proximity packet from the local mic.
-    // sess_id is the session_id from auth_ok (cached in the network).
-    // opus_payload may be any size up to kMaxPacketBytes.
-    void SendProximityFrame(uint32_t seq,
-                            float x, float y, float z, uint32_t instance_id,
+    // Send a proximity audio frame. The client doesn't supply
+    // position; the service knows it from L2J events.
+    void SendProximityFrame(uint16_t seq,
                             const uint8_t* opus_payload, int opus_len);
 
     // Send a keepalive (header-only) — call every 15s while

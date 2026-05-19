@@ -63,8 +63,10 @@ struct MonoRing {
 
 struct Source {
     MonoRing ring;
-    float    delta_x = 0, delta_y = 0, delta_z = 0;
-    float    volume  = 0.0f;     // already includes distance attenuation
+    // gain and pan are supplied by the caller (service computes them
+    // from L2J positions in protocol rev 2). No spatial math here.
+    float    gain  = 0.0f;       // 0..1
+    float    pan   = 0.0f;       // -1..+1
     std::chrono::steady_clock::time_point last_mix{};
 };
 
@@ -131,22 +133,13 @@ struct AudioPlayback::Impl {
     ma_device device{};
     std::mutex sources_mu;
     std::unordered_map<uint32_t, Source> sources;
-    float min_dist = 500.0f;
-    float max_dist = 2500.0f;
     bool running = false;
 
-    // Compute pan from listener-relative delta. We assume the listener
-    // faces +Y in L2's world frame (good-enough approximation for MVP;
-    // the client doesn't expose camera yaw cleanly to memory).
-    static void PanFromDelta(float dx, float /*dy*/, float /*dz*/,
-                             float& left, float& right) {
-        // Pan in [-1, +1] based on horizontal X delta, clamped to a
-        // 1500 cm half-width (audio is mostly localized within ~15 m).
-        float p = dx / 1500.0f;
-        if (p < -1.f) p = -1.f;
-        if (p >  1.f) p =  1.f;
-        // Equal-power: gain_L = cos((p+1)*pi/4), gain_R = sin((p+1)*pi/4)
-        float theta = (p + 1.f) * 0.785398163f;  // pi/4
+    // Equal-power pan: pan in [-1, +1] → (left, right) gains.
+    static void PanGains(float pan, float& left, float& right) {
+        if (pan < -1.f) pan = -1.f;
+        if (pan >  1.f) pan =  1.f;
+        float theta = (pan + 1.f) * 0.785398163f;  // (pan+1) * pi/4
         left  = std::cos(theta);
         right = std::sin(theta);
     }
@@ -160,15 +153,14 @@ struct AudioPlayback::Impl {
         for (auto& [id, src] : self->sources) {
             if (src.ring.Available() == 0) continue;
 
-            // Pull mono into temp buffer (up to frame_count samples).
             int16_t mono[1024];
             ma_uint32 n = frame_count > 1024 ? 1024 : frame_count;
             uint32_t got = src.ring.Pop(mono, n);
             if (got == 0) continue;
 
             float lpan, rpan;
-            PanFromDelta(src.delta_x, src.delta_y, src.delta_z, lpan, rpan);
-            float gain = src.volume;
+            PanGains(src.pan, lpan, rpan);
+            float gain = src.gain;
 
             for (uint32_t i = 0; i < got; ++i) {
                 int32_t l = out[i * 2 + 0] + (int32_t)(mono[i] * lpan * gain);
@@ -213,18 +205,13 @@ void AudioPlayback::Stop() {
 
 bool AudioPlayback::IsRunning() const { return impl_->running; }
 
-void AudioPlayback::SetAttenuation(float min_dist, float max_dist) {
-    impl_->min_dist = min_dist;
-    impl_->max_dist = max_dist;
-}
-
 void AudioPlayback::Enqueue(uint32_t src_id,
                             const int16_t* mono_pcm, uint32_t samples,
-                            float dx, float dy, float dz, float volume) {
+                            float gain, float pan) {
     std::lock_guard<std::mutex> lk(impl_->sources_mu);
     auto& src = impl_->sources[src_id];
-    src.delta_x = dx; src.delta_y = dy; src.delta_z = dz;
-    src.volume  = volume;
+    src.gain = gain;
+    src.pan  = pan;
     if (mono_pcm && samples > 0) {
         src.ring.Push(mono_pcm, samples);
     }

@@ -3,18 +3,17 @@
 // VoiceNetwork PacketCallback → OpusDecoder → AudioPlayback::Enqueue
 // on incoming packets.
 //
-// MVP scope: PROXIMITY ONLY. PTT proximity key (default 'V') gates
-// the send path. Multibox and channel switching come later.
+// Proximity routing and per-receiver gain/pan happen on the service
+// (protocol rev 2). The client just plays whatever gain/pan the
+// service stamps onto each packet.
 
 #include "voice.h"
 #include "audio_io.h"
-#include "memory_reader.h"
 #include "opus_codec.h"
 #include "voice_network.h"
 
 #include <windows.h>
 #include <atomic>
-#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -29,8 +28,7 @@ struct Mod {
     Config cfg{};
     std::atomic<bool> running{false};
 
-    std::atomic<bool> ptt_proximity_down{false};
-    std::atomic<uint32_t> tx_seq{0};
+    std::atomic<uint16_t> tx_seq{0};
 
     AudioCapture capture;
     AudioPlayback playback;
@@ -54,51 +52,33 @@ struct Mod {
 
 Mod g_mod;
 
-float Distance3D(float dx, float dy, float dz) {
-    return std::sqrt(dx * dx + dy * dy + dz * dz);
-}
-
-float DistanceGain(float dist, float min_dist, float max_dist) {
-    if (dist <= min_dist) return 1.0f;
-    if (dist >= max_dist) return 0.0f;
-    return 1.0f - (dist - min_dist) / (max_dist - min_dist);
-}
-
 void OnCaptureFrame(const int16_t* pcm, uint32_t samples) {
     if (!g_mod.running.load()) return;
     if (samples != kFrameSamples) return;
 
-    // PTT gate (Win32 GetAsyncKeyState — high bit set when pressed).
     bool ptt = false;
     if (g_mod.cfg.ptt_proximity != 0) {
         ptt = (GetAsyncKeyState(g_mod.cfg.ptt_proximity) & 0x8000) != 0;
     }
-    g_mod.ptt_proximity_down.store(ptt);
     if (!ptt) return;
     if (!g_mod.net.IsConnected()) return;
-
-    LocalPlayerState s = ReadLocalPlayerState();
-    if (!s.ok) {
-        // Stub mode: send zeros so the server still routes us in
-        // loopback (we'll receive ourselves back when -echo is on).
-        s.x = s.y = s.z = 0.0f;
-        s.instance_id = 0;
-    }
 
     uint8_t opus_buf[kMaxPacketBytes];
     int n = g_mod.encoder.Encode(pcm, opus_buf, sizeof(opus_buf));
     if (n <= 0) return;
 
-    uint32_t seq = g_mod.tx_seq.fetch_add(1, std::memory_order_relaxed);
-    g_mod.net.SendProximityFrame(seq, s.x, s.y, s.z, s.instance_id,
-                                 opus_buf, n);
+    uint16_t seq = g_mod.tx_seq.fetch_add(1, std::memory_order_relaxed);
+    g_mod.net.SendProximityFrame(seq, opus_buf, n);
 }
 
-void OnIncomingPacket(uint8_t channel, uint32_t src,
-                      uint32_t /*seq*/,
-                      float x, float y, float z, uint32_t /*inst*/,
+void OnIncomingPacket(uint8_t channel, uint32_t src, uint16_t /*seq*/,
+                      uint8_t gain_u8, int8_t pan_i8,
                       const uint8_t* opus_payload, uint16_t opus_len) {
-    if (channel != 0) return;
+    // Channel 0 = proximity (gain/pan supplied by service).
+    // Channels 1..4 = group voice (gain=255 pan=0 by convention).
+    if (channel > 4) return;
+    if (channel != 0 && (channel < 1 || channel > 4)) return;
+
     OpusDecoder* dec = g_mod.DecoderFor(src);
     if (!dec) return;
 
@@ -106,14 +86,9 @@ void OnIncomingPacket(uint8_t channel, uint32_t src,
     int got = dec->Decode(opus_payload, opus_len, pcm, kFrameSamples);
     if (got <= 0) return;
 
-    LocalPlayerState me = ReadLocalPlayerState();
-    float dx = x - (me.ok ? me.x : 0.0f);
-    float dy = y - (me.ok ? me.y : 0.0f);
-    float dz = z - (me.ok ? me.z : 0.0f);
-    float dist = Distance3D(dx, dy, dz);
-    float gain = DistanceGain(dist, g_mod.cfg.min_dist_cm, g_mod.cfg.max_dist_cm);
-
-    g_mod.playback.Enqueue(src, pcm, (uint32_t)got, dx, dy, dz, gain);
+    float gain = (float)gain_u8 / 255.0f;
+    float pan  = (float)pan_i8  / 127.0f;
+    g_mod.playback.Enqueue(src, pcm, (uint32_t)got, gain, pan);
 }
 
 }  // namespace
@@ -170,9 +145,8 @@ bool Init(const Config& cfg) {
 
     g_mod.cfg = cfg;
 
-    if (!g_mod.encoder.Init())   return false;
-    if (!g_mod.playback.Start(cfg.playback_device)) return false;
-    g_mod.playback.SetAttenuation(cfg.min_dist_cm, cfg.max_dist_cm);
+    if (!g_mod.encoder.Init())                       return false;
+    if (!g_mod.playback.Start(cfg.playback_device))  return false;
 
     if (!g_mod.capture.Start(cfg.capture_device, &OnCaptureFrame)) {
         g_mod.playback.Stop();
@@ -199,10 +173,8 @@ void Shutdown() {
 }
 
 void OnRenderFrame() {
-    // Refresh the cached local-player state once per frame, so the
-    // next 20ms capture frame stamps fresh coordinates.
-    RefreshLocalPlayerState();
-    // HUD ImGui panel: deferred — not blocking the loopback test.
+    // No-op in rev 2 — position comes from the server.
+    // Reserved for future HUD work (ImGui "X is speaking" badge).
 }
 
 void SetAuthToken(const char* token, uint32_t player_id) {

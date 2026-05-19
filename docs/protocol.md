@@ -1,6 +1,6 @@
 # Voice System — Protocol Specification
 
-**Version:** 1 (draft, awaiting approval)
+**Version:** 1 (draft rev 2 — server-side position pivot)
 **Date:** 2026-05-19
 **Target:** L2 Essence 542 SamuraiCrow client + Go voice service + L2J bridge
 
@@ -8,16 +8,23 @@ This document defines the wire formats between the three parts of the
 system. Once approved, deviation requires a new protocol version
 (`u8 version` field).
 
+> **Rev 2 change (2026-05-19):** Player position is now sourced from
+> the L2J server (authoritative) instead of read from client memory.
+> Client UDP packets no longer carry x/y/z/instance_id. The voice-
+> service performs spatial routing using positions pushed by the L2J
+> bridge over Redis, and computes per-receiver `gain`+`pan` which it
+> stamps into the outbound packet so the client only mixes.
+
 ---
 
 ## 1. Transports
 
 | Transport | Direction | Purpose |
 |-----------|-----------|---------|
-| UDP | client ↔ voice-service, both ways | audio frames (Opus payload + metadata). low latency, drops acceptable |
-| WebSocket (TCP) | client ↔ voice-service | control/signaling, auth, topology updates. ordered, reliable |
-| Redis pub/sub | l2j-bridge → voice-service | server-side social events (party joins, clan changes, zone transitions) |
-| HTTP | client → l2j-bridge | one-shot token issuance (after game login) |
+| UDP | client ↔ voice-service, both ways | audio frames (Opus payload + minimal header). Low latency, drops acceptable |
+| WebSocket (TCP) | client ↔ voice-service | control/signaling, auth, topology updates. Ordered, reliable |
+| Redis pub/sub | l2j-bridge → voice-service | player positions + social events |
+| HTTP | voice-service → l2j-bridge | token validation; player metadata fetch |
 
 **Endpoints (defaults; configurable):**
 - UDP audio: `udp/17666`
@@ -26,104 +33,101 @@ system. Once approved, deviation requires a new protocol version
 - Redis: `tcp/6379` (channel `l2voice:events`)
 
 **TLS:**
-- UDP audio: **plaintext** (latency-critical, content is voice with token-bound session IDs — eavesdropping isn't catastrophic)
-- WebSocket: **WSS recommended** in production (TLS, optional in dev — flag `voice.tls=true`)
-- HTTP auth endpoint: **HTTPS recommended** for production
+- UDP audio: **plaintext** (latency-critical; session_id is per-login secret)
+- WebSocket: **WSS recommended** in production
+- HTTP auth endpoint: **HTTPS recommended** in production
 
 ---
 
 ## 2. Authentication flow
 
 ```
-1. Player logs into L2 (existing flow, our DLL already loaded)
+1. Player logs into L2 (existing flow, l2voice.dll already loaded)
 2. L2J generates a one-time voice token at OnPlayerLogin:
-     token = HMAC(secret_key, player_object_id + login_timestamp)
-3. L2J broadcasts the token to the client via a custom Say2 system
-   message OR a small custom packet our DLL intercepts (TBD — option A
-   is simpler for v1, option B is cleaner long-term)
-4. DLL captures the token, then opens WS connection to voice-service
-5. DLL sends `auth` event with token + player_object_id
-6. Voice-service forwards token+player_id to L2J HTTP endpoint
-7. L2J validates token, returns session_id (UUID) + player metadata
+     token = HMAC(secret_key, player_object_id || login_timestamp)
+3. L2J broadcasts the token to the client via a custom system message
+   (Say2 type 18) OR a small custom packet l2voice.dll intercepts
+4. DLL captures the token, opens WS to voice-service
+5. DLL sends `auth` with token + player_object_id
+6. Voice-service POSTs to L2J `/voice/validate` with token+player_id
+7. L2J validates, returns session_id + player metadata
 8. Voice-service responds `auth_ok` with session_id and UDP endpoint
-9. DLL begins sending UDP audio with this session_id in header
+9. DLL begins sending UDP audio with session_id in header
 ```
 
-Session expires on:
-- WebSocket disconnect (idle timeout 60s)
-- Explicit `logout` event
-- Player leaves game (L2J publishes event → voice-service kicks)
+Session ends on: WS disconnect (60s idle), explicit `logout`,
+L2J `player_logout` event, or `/voice/validate` failure.
 
 ---
 
 ## 3. UDP audio packet format
 
-All multi-byte fields are **little-endian** (x86 native; both client and
-service are LE). Fields are packed (no padding).
+All multi-byte fields are **little-endian**. Fields are packed.
 
-### 3.1 Common header (8 bytes)
+The protocol is **asymmetric** because spatial routing happens in the
+service:
 
-```
-offset  size  field        description
-------  ----  -----------  -------------------------------------
-0       1     version      protocol version (current: 0x01)
-1       1     channel      0=proximity, 1=party, 2=clan, 3=ally,
-                           4=siege, 5=keepalive, 6=ping_req, 7=ping_resp
-2       2     seq_lo       sequence number low 16 bits (high 16 in seq_hi)
-4       4     session_id   little-endian uint32, issued by voice-service
-                           at auth_ok. Replaces raw player_id on the wire
-                           (player_id is mapped by service internally).
-```
+- **Ingress** (client → service): just announces audio frames. The
+  service knows the sender's position from L2J, so the client doesn't
+  carry it.
+- **Egress** (service → client): adds 2 bytes of pre-computed spatial
+  info (`gain`, `pan`) for the proximity channel so the client only
+  mixes — no per-frame trigonometry on the client side.
 
-### 3.2 Channel-specific extensions
-
-**Channel 0 (proximity)** — 20 bytes positional metadata after common header:
+### 3.1 Ingress — client → service (8 bytes header + payload)
 
 ```
 offset  size  field
-------  ----  ------------
-8       4     x (f32)         world x in cm (L2 native unit)
-12      4     y (f32)         world y
-16      4     z (f32)         world z
-20      4     instance_id     u32, 0 = main world, non-zero = instance
-24      2     seq_hi          sequence number high 16 bits
-26      2     opus_len        length of Opus payload (max 1024)
-28+     ...   opus_payload    Opus-encoded audio frame (20ms @ 48kHz mono)
+------  ----  -------------------------------------------------
+0       1     version       protocol version (0x01)
+1       1     channel       0=proximity, 1=party, 2=clan, 3=ally,
+                            4=siege, 5=keepalive, 6=ping_req
+2       2     seq_lo        sequence number low 16 bits
+4       4     session_id    assigned by service at auth_ok
+8+      ...   opus_payload  Opus frame (omitted for channel 5/6)
 ```
 
-Total packet size ≤ 28 + 1024 = 1052 bytes (fits well under any MTU).
+Total ingress packet size ≤ 8 + 1024 = 1032 bytes.
 
-**Channels 1,2,3,4 (party/clan/ally/siege)** — no positional data:
+### 3.2 Egress — service → client
+
+**Proximity (channel 0): 10 bytes header + payload.**
 
 ```
 offset  size  field
-------  ----  ------------
-8       2     seq_hi          sequence number high 16 bits
-10      2     opus_len        length of Opus payload
-12+     ...   opus_payload    Opus-encoded audio frame
+------  ----  -------------------------------------------------
+0       1     version          0x01
+1       1     channel          0 (proximity)
+2       2     seq_lo           passed through from sender
+4       4     src_session_id   who is talking
+8       1     gain             0..255  (255 = full, 0 = silent;
+                                service never sends 0 — drops packet
+                                instead)
+9       1     pan              int8 -127..+127 (0 = center,
+                                negative = left, positive = right)
+10+     ...   opus_payload
 ```
 
-Total packet size ≤ 12 + 1024 = 1036 bytes.
+**Party/clan/ally/siege (channels 1..4): 8 bytes header + payload.**
 
-**Channel 5 (keepalive)** — header only, no payload. Sent every 15s
-when client is silent, to keep NAT mapping open.
+Same as ingress shape, with `src_session_id` in the sid field. No
+spatial bytes — these channels are non-positional.
 
-**Channel 6/7 (ping_req/resp)** — header only. Used by client to
-measure RTT. Service echoes received `seq` back as channel 7 with the
-same session_id. Client computes RTT from local timestamp delta.
+**Ping_resp (channel 7): 8 bytes header only.** Echoes back the
+seq_lo of the corresponding ping_req.
 
 ### 3.3 Opus frame parameters (fixed)
 
-- Sample rate: 48000 Hz
+- Sample rate: 48 000 Hz
 - Channels: 1 (mono)
-- Frame size: 20ms (960 samples)
+- Frame size: 20 ms (960 samples)
 - Bitrate: 24 kbps
 - Complexity: 5
-- FEC: enabled (Forward Error Correction)
+- FEC: enabled
 - Application: VOIP
 
-These are fixed in the protocol — both sides agree without negotiation.
-If we need to change, bump `version` field.
+Fixed in the protocol — both sides agree without negotiation. Bump
+`version` to change.
 
 ---
 
@@ -133,164 +137,100 @@ UTF-8 JSON, one message per WS frame. Both sides validate `type`.
 
 ### 4.1 Client → Server
 
-#### `auth`
-```json
-{
-  "type": "auth",
-  "token": "base64url-hmac-from-l2j",
-  "player_id": 1234567,
-  "client_version": "l2ui/0.5.0"
-}
-```
+| `type` | Payload fields |
+|--------|----------------|
+| `auth` | `token`, `player_id`, `client_version` |
+| `channel_join` | `channel` (party/clan/ally) |
+| `channel_leave` | `channel` |
+| `mute` | `target_player_id`, `muted` |
+| `state_update` | `ptt_channel`, `speaking` |
+| `logout` | (none) |
 
-#### `channel_join`
-```json
-{
-  "type": "channel_join",
-  "channel": "proximity"
-}
-```
-For proximity, joining is automatic at auth; client sends explicit for party/clan/ally.
-
-#### `channel_leave`
-```json
-{
-  "type": "channel_leave",
-  "channel": "party"
-}
-```
-
-#### `mute`
-```json
-{
-  "type": "mute",
-  "target_player_id": 999,
-  "muted": true
-}
-```
-Client-side mute is enforced at playback; server is informed for UI sync.
-
-#### `state_update`
-```json
-{
-  "type": "state_update",
-  "ptt_channel": "proximity",
-  "speaking": true
-}
-```
-Sent on PTT key press/release. Server forwards to receivers as
-`speaker_state` so they can show "X is speaking" in UI.
-
-#### `logout`
-```json
-{
-  "type": "logout"
-}
-```
-Graceful close. Server tears down session.
+Proximity channel is auto-joined at auth.
 
 ### 4.2 Server → Client
 
-#### `auth_ok`
-```json
-{
-  "type": "auth_ok",
-  "session_id": 305419896,
-  "udp_endpoint": "voice.example.com:17666",
-  "your_player_id": 1234567
-}
-```
-
-#### `auth_fail`
-```json
-{
-  "type": "auth_fail",
-  "reason": "token_expired"
-}
-```
-Reasons: `token_invalid`, `token_expired`, `player_not_found`, `already_connected`.
-
-#### `topology_update`
-```json
-{
-  "type": "topology_update",
-  "party_members":  [123, 456],
-  "clan_members":   [123, 456, 789],
-  "ally_members":   [...],
-  "instance_id":    0,
-  "in_olympiad":    false,
-  "in_siege":       0
-}
-```
-Sent on any social change (party/clan/zone). Client uses to draw UI
-indicators and to filter incoming audio if local-side spatial wants
-to know who's in its party.
-
-#### `speaker_state`
-```json
-{
-  "type": "speaker_state",
-  "player_id": 789,
-  "channel": "party",
-  "speaking": true
-}
-```
-For UI ("X is speaking" indicator).
-
-#### `error`
-```json
-{
-  "type": "error",
-  "code": 1001,
-  "message": "human-readable"
-}
-```
+| `type` | Payload fields |
+|--------|----------------|
+| `auth_ok` | `session_id`, `udp_endpoint`, `your_player_id` |
+| `auth_fail` | `reason` (`token_invalid`, `token_expired`, `player_not_found`, `already_connected`) |
+| `topology_update` | `party_members[]`, `clan_members[]`, `ally_members[]`, `instance_id`, `in_olympiad`, `in_siege` |
+| `speaker_state` | `player_id`, `channel`, `speaking` |
+| `error` | `code`, `message` |
 
 ---
 
 ## 5. Redis pub/sub (l2j-bridge → voice-service)
 
-Channel name: `l2voice:events`
+Channel: `l2voice:events`
 Format: UTF-8 JSON, one message per pub.
 
 ```json
 {
   "ts": 1716124800000,
-  "event": "party_join",   // see list below
-  "player_id": 123,
-  "data": { ... }          // event-specific
+  "event": "position",
+  "player_id": 1234567,
+  "data": { ... }
 }
 ```
 
-**Event types:**
-| event | data fields |
-|-------|------------|
-| `player_login` | `name`, `class_id`, `level`, `clan_id`, `ally_id`, `party_id` |
-| `player_logout` | (none) |
-| `party_join` | `party_id`, `member_ids[]` |
-| `party_leave` | `party_id` |
-| `clan_join` | `clan_id` |
-| `clan_leave` | (none) |
-| `ally_change` | `ally_id` (0 = left) |
-| `zone_enter` | `zone_type` (oly/siege/etc), `zone_id`, `instance_id` |
-| `zone_exit` | `zone_type`, `zone_id` |
-| `death` | (none) |
-| `revive` | (none) |
-| `position` | `x`, `y`, `z`, `instance_id` (low-frequency, only on zone change — high-freq comes via UDP from client) |
+### 5.1 Event types
 
-Voice-service maintains in-memory topology and reacts. On `party_join`,
-all members get a `topology_update` over their WS.
+| `event` | When | `data` fields |
+|---------|------|----------------|
+| `player_login` | OnPlayerLogin | `name`, `class_id`, `level`, `clan_id`, `ally_id`, `party_id`, `x`, `y`, `z`, `instance_id` |
+| `player_logout` | OnPlayerLogout / disconnect | (none) |
+| `position` | broadcast every ~200ms while moving; once on stop | `x`, `y`, `z`, `instance_id` |
+| `party_join` | OnPartyChange | `party_id`, `member_ids[]` |
+| `party_leave` | OnPartyChange | `party_id` |
+| `clan_change` | OnClanJoin / OnClanLeave | `clan_id` (0 = left) |
+| `ally_change` | OnAllyChange | `ally_id` (0 = left) |
+| `instance_change` | OnEnterInstance / OnExitInstance | `instance_id` |
+| `zone_special` | enter/exit olympiad/siege/peace | `kind` (oly/siege/peace), `entering` (bool) |
+
+### 5.2 Position broadcast cadence
+
+The bridge throttles per player:
+- Movement: ≤ 5 Hz (one message per 200 ms), only if `|Δp| > 50 cm`
+- Stationary: one final message at stop, then suppressed
+- Teleport / instance change: an extra synchronous message
+
+The voice-service maintains `player_id → {x,y,z,instance_id}` in memory
+and recomputes per-receiver `gain`/`pan` at the moment it routes each
+audio packet. Position freshness window: positions older than 2 s are
+treated as "unknown" and the player is dropped from the proximity set
+for that frame.
+
+### 5.3 Spatial computation (service-side)
+
+When forwarding a proximity packet from speaker `S` to receiver `R`:
+
+```
+dx = S.x - R.x
+dy = S.y - R.y
+dz = S.z - R.z
+dist = sqrt(dx² + dy² + dz²)
+if dist >= max_dist_cm:  drop (don't send)
+gain_f = 1 - max(0, dist - min_dist_cm) / (max_dist_cm - min_dist_cm)
+gain_u8 = round(gain_f * 255)
+pan_f = clamp(dx / 1500, -1, +1)        # horizontal-only
+pan_i8 = round(pan_f * 127)
+```
+
+`min_dist_cm` and `max_dist_cm` are configurable on the service
+(defaults 500 / 2500). Clients can override locally for HUD purposes
+but the wire decision is service-authoritative.
 
 ---
 
-## 6. HTTP auth endpoint (l2j-bridge)
+## 6. HTTP — voice-service → l2j-bridge
 
-`POST /voice/validate`
+### `POST /voice/validate`
 
-Request body (JSON):
+Request:
 ```json
 {
-  "token": "...",
+  "token": "base64url-hmac",
   "player_id": 1234567
 }
 ```
@@ -305,28 +245,28 @@ Response 200:
     "class_id": 105,
     "level": 85,
     "clan_id": 42,
-    "ally_id": 7
+    "ally_id": 7,
+    "party_id": 0,
+    "x": 81000, "y": 148000, "z": -3470,
+    "instance_id": 0
   }
 }
 ```
 
 Response 401:
 ```json
-{
-  "valid": false,
-  "reason": "token_expired"
-}
+{ "valid": false, "reason": "token_expired" }
 ```
 
-Called by voice-service on receipt of WS `auth`. Voice-service caches
-session details locally so subsequent UDP packets don't hit L2J.
+Called once per WS auth. Subsequent UDP packets reuse the cached
+session.
 
 ---
 
-## 7. Open decisions (need user confirmation)
+## 7. Open decisions (resolved with defaults; can revisit)
 
-1. **Token delivery to client**: option A (Say2 system message that DLL parses) vs option B (custom L2J packet that DLL intercepts via hook). A is simpler v1, B is cleaner production.
-2. **Should we use protobuf instead of JSON for WS?** JSON easier to debug, protobuf saves ~30% bandwidth. WS is low-volume so probably not worth the complexity.
-3. **NAT/STUN/TURN**: assume client → service UDP works directly (most home NATs allow outbound UDP + keepalive). If symmetric NAT breaks, add STUN/TURN later.
-4. **Server-side mixing vs client-side mixing**: prompt says client-side (proximity routes packets unmixed, client renders 3D). Confirm: party/clan/ally also unmixed?
-5. **Encryption of UDP audio**: plaintext (current proposal) vs lightweight (ChaCha20 stream with session-derived key). Plaintext saves CPU and is fine if session_id is hard to guess.
+1. **Token delivery to client:** Say2 system message (simpler v1).
+2. **WS encoding:** JSON (easier to debug; low volume).
+3. **NAT:** assume outbound UDP works (most home NATs). STUN/TURN if needed.
+4. **Server-side mixing vs client-side mixing:** **client mixes**; service routes + stamps gain/pan only.
+5. **UDP encryption:** plaintext (session_id is the secret).

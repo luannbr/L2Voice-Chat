@@ -67,7 +67,6 @@ add_library(l2voice SHARED
     voice/audio_io.cpp
     voice/opus_codec.cpp
     voice/voice_network.cpp
-    voice/memory_reader.cpp
 )
 
 target_include_directories(l2voice PRIVATE
