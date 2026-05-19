@@ -48,8 +48,17 @@ const (
 	chPingResp  uint8 = 7
 )
 
+// Config bundles router-mode flags.
+type Config struct {
+	// Echo: every proximity packet is bounced back to its sender
+	// (in addition to normal spatial routing — used for loopback
+	// validation of audio capture/codec/UDP path before there are
+	// two clients to test with).
+	Echo bool
+}
+
 // Serve binds udpAddr and routes audio packets until ctx is cancelled.
-func Serve(ctx context.Context, udpAddr string, state *topology.State) error {
+func Serve(ctx context.Context, udpAddr string, state *topology.State, cfg Config) error {
 	addr, err := net.ResolveUDPAddr("udp", udpAddr)
 	if err != nil {
 		return err
@@ -112,6 +121,10 @@ func Serve(ctx context.Context, udpAddr string, state *topology.State) error {
 		switch channel {
 		case chProximity:
 			routeProximity(buf[:n], sess, state, conn)
+			if cfg.Echo {
+				// Echo back to sender for loopback testing.
+				_, _ = conn.WriteToUDP(buf[:n], from)
+			}
 		case chKeepalive:
 			// noop, RememberUDP already touched LastSeen via RememberUDP path
 		case chPingReq:

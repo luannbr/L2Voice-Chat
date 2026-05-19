@@ -1,4 +1,5 @@
-// voice.h — Public API of the voice module inside l2ui.dll.
+// voice.h — Public API of the voice module inside l2voice.dll
+// (standalone, separate from l2ui/AutoLogin).
 //
 // Architecture (proximity MVP):
 //

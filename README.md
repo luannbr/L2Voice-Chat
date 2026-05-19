@@ -1,8 +1,9 @@
 # Voice System for L2 Essence 542
 
 Three-channel voice chat integrated into the L2 client: proximity (3D
-positional), party (closed group), clan/ally (global). Extends the
-existing `l2ui.dll` (login overlay) — does NOT replace it.
+positional), party (closed group), clan/ally (global). Ships as its
+own DLL — **`l2voice.dll`**, separate from `l2ui.dll` (AutoLogin).
+Both can be injected side-by-side via the Engine.dll IAT method.
 
 ## Target
 
@@ -16,8 +17,8 @@ existing `l2ui.dll` (login overlay) — does NOT replace it.
 ┌─────────────────────┐         ┌──────────────────────┐         ┌─────────────┐
 │  Cliente L2 + DLL   │◄───────►│  Serviço de Voz (Go) │◄───────►│   L2J Core  │
 │  (C++, MSVC v143)   │  UDP    │   SFU + Mixer        │  Redis  │  (Java 17)  │
-│  l2ui.dll +         │  audio  │   :17666 udp         │  pub/sub│  + bridge   │
-│   voice/* module    │  WS     │   :17667 ws          │         │  module     │
+│  l2voice.dll        │  audio  │   :17666 udp         │  pub/sub│  + bridge   │
+│  (standalone)       │  WS     │   :17667 ws          │         │  module     │
 │                     │  ctrl   │                      │         │  :17668 http│
 └─────────────────────┘         └──────────────────────┘         └─────────────┘
 ```
@@ -32,8 +33,10 @@ Voice_System/
 ├── README.md              this file
 ├── docs/
 │   └── protocol.md        binary UDP + WS JSON + Redis pub/sub spec
-├── client/                EXTENSION of l2ui.dll (not standalone)
-│   └── voice/             new module: capture, playback, codec, net, memreader
+├── client/                STANDALONE DLL → l2voice.dll
+│   ├── CMakeLists.txt     top-level build
+│   ├── dllmain.cpp        entry point + 50 Hz poll thread
+│   └── voice/             module: capture, playback, codec, net, memreader
 ├── voice-service/         Go service (standalone)
 │   ├── cmd/voice-server/  main package
 │   └── internal/          audio router, topology, auth
@@ -70,7 +73,7 @@ Scope reduced to **proximity only** for the first end-to-end demo; party/clan/al
 
 | Component | Tools |
 |-----------|-------|
-| `client/` | Same as existing l2ui.dll: VS2022 + CMake (already set up under `../overlay`) |
+| `client/` | VS2022 + CMake 3.20+ (own project; see `client/README.md`) |
 | `voice-service/` | Go 1.22+ — install from https://go.dev/dl/ |
 | `l2j-bridge/` | JDK 17 + Maven (matches l2emuproject Essence build) |
 
@@ -86,5 +89,5 @@ go build -o voice-server.exe ./cmd/voice-server
 
 1. `Prompt.txt` — original brief
 2. `docs/protocol.md` — wire formats (read this BEFORE coding either side)
-3. Existing DLL: `../overlay/src/` — current login overlay, where the voice module will integrate
+3. `client/README.md` — how to build and inject `l2voice.dll`
 4. Existing memories under `~/.claude/projects/.../memory/` — known engine RVAs, injection method (Engine.dll IAT), gotchas

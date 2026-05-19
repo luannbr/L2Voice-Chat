@@ -29,6 +29,7 @@ import (
 func main() {
 	udpAddr := flag.String("udp", ":17666", "UDP listen address for audio")
 	wsAddr := flag.String("ws", ":17667", "TCP listen address for WebSocket control")
+	echo := flag.Bool("echo", false, "echo every proximity packet back to the sender (loopback test mode)")
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
@@ -40,9 +41,10 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	audioCfg := audio.Config{Echo: *echo}
 	// UDP audio router runs in its own goroutine; cancelling ctx stops it.
 	go func() {
-		if err := audio.Serve(ctx, *udpAddr, state); err != nil {
+		if err := audio.Serve(ctx, *udpAddr, state, audioCfg); err != nil {
 			log.Fatalf("audio.Serve: %v", err)
 		}
 	}()
