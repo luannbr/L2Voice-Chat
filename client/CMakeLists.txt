@@ -58,6 +58,7 @@ FetchContent_Declare(
 set(USE_TLS      OFF CACHE BOOL "" FORCE)
 set(USE_OPEN_SSL OFF CACHE BOOL "" FORCE)
 set(USE_MBED_TLS OFF CACHE BOOL "" FORCE)
+set(USE_ZLIB     OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(ixwebsocket)
 
 # ---- the DLL --------------------------------------------------------
