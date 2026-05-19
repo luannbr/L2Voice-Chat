@@ -185,7 +185,10 @@ struct VoiceNetwork::Impl {
 
     void TrySendAuth() {
         std::lock_guard<std::mutex> lk(auth_mu);
-        if (token.empty()) return;
+        // Gate on player_id, not token. The voice-service validates the
+        // player against the L2J bridge — the token is currently unused
+        // (kept for forward-compat with a future cryptographic path).
+        if (player_id == 0) return;
         if (auth_sent.load()) return;
         if (!connected.load()) return;
         ws.send(MakeAuthJson(token, player_id));

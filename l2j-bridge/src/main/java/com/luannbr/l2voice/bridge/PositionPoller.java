@@ -1,6 +1,5 @@
 package com.luannbr.l2voice.bridge;
 
-import java.lang.reflect.Method;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -50,9 +49,9 @@ final class PositionPoller {
 
     private void run() {
         long periodMs = 1000L / hz;
-        L2WorldReflector world;
+        L2WorldRef world;
         try {
-            world = new L2WorldReflector();
+            world = new L2WorldRef();
         } catch (Exception e) {
             log.log(Level.SEVERE, "could not bind L2World via reflection; poller disabled", e);
             return;
@@ -88,55 +87,4 @@ final class PositionPoller {
         pub.publishPosition(objectId, x, y, z, instanceId);
     }
 
-    /**
-     * Reflection helper. Bound to the Essence 542 class layout:
-     *   {@code net.l2emuproject.gameserver.model.L2World#getAllPlayers()} (static)
-     *   {@code net.l2emuproject.gameserver.model.actor.instance.L2PcInstance}
-     *   — getObjectId(), getX(), getY(), getZ(), getInstanceId()
-     */
-    private static final class L2WorldReflector {
-        private final Method       getAllPlayers;     // static
-        private final Method       getObjectId;
-        private final Method       getX, getY, getZ;
-        private final Method       getInstanceId;
-
-        L2WorldReflector() throws Exception {
-            Class<?> world = Class.forName("net.l2emuproject.gameserver.model.L2World");
-            getAllPlayers = world.getMethod("getAllPlayers");  // static, no args
-
-            Class<?> pc = Class.forName(
-                    "net.l2emuproject.gameserver.model.actor.instance.L2PcInstance");
-            getObjectId   = pc.getMethod("getObjectId");
-            getX          = pc.getMethod("getX");
-            getY          = pc.getMethod("getY");
-            getZ          = pc.getMethod("getZ");
-            getInstanceId = pc.getMethod("getInstanceId");
-        }
-
-        @FunctionalInterface
-        interface Sink {
-            void accept(int oid, int x, int y, int z, int instanceId);
-        }
-
-        void forEachPlayer(Sink sink) throws Exception {
-            Object res = getAllPlayers.invoke(null);  // static call
-            if (res instanceof Iterable<?> iter) {
-                for (Object p : iter) snapshot(p, sink);
-            } else if (res instanceof Object[] arr) {
-                for (Object p : arr) snapshot(p, sink);
-            } else if (res instanceof java.util.Map<?, ?> map) {
-                for (Object p : map.values()) snapshot(p, sink);
-            }
-        }
-
-        private void snapshot(Object p, Sink sink) throws Exception {
-            if (p == null) return;
-            int oid = (int) getObjectId.invoke(p);
-            int x   = (int) getX.invoke(p);
-            int y   = (int) getY.invoke(p);
-            int z   = (int) getZ.invoke(p);
-            int inst = (int) getInstanceId.invoke(p);
-            sink.accept(oid, x, y, z, inst);
-        }
-    }
 }

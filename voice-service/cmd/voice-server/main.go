@@ -32,6 +32,7 @@ func main() {
 	wsAddr := flag.String("ws", ":17667", "TCP listen address for WebSocket control")
 	redisAddr := flag.String("redis", "", "Redis broker for L2J event subscription (host:port; empty = disabled)")
 	redisChan := flag.String("redis-chan", "l2voice:events", "Redis pub/sub channel")
+	l2jCheck := flag.String("l2j-check", "", "L2J bridge /voice/check URL for online-player validation (empty = accept any player_id; dev only)")
 	echo := flag.Bool("echo", false, "echo every proximity packet back to the sender (loopback test mode)")
 	flag.Parse()
 
@@ -40,6 +41,14 @@ func main() {
 
 	// Shared state across UDP and WS handlers.
 	state := topology.NewState()
+
+	// Wire the L2J /voice/check endpoint (empty = stub-accept-all).
+	control.SetCheckEndpoint(*l2jCheck)
+	if *l2jCheck == "" {
+		log.Printf("control: no -l2j-check set; accepting any player_id (dev mode)")
+	} else {
+		log.Printf("control: validating player_id via %s", *l2jCheck)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

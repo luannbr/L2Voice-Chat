@@ -67,6 +67,15 @@ struct Config {
     // Master flags.
     bool     enabled;            // false = module loaded but inert
     bool     auto_connect;       // try to auth WS at startup
+
+    // TEMP — task #29: replace with a g_localUser->ObjectId memory
+    // read once the offset is mapped. For now, voice.ini carries the
+    // player_id so the DLL can pass it on auth. This is NOT a
+    // credential — the voice-service still validates against the L2J
+    // bridge (/voice/check). An attacker who edits this file just
+    // claims to be a player; if that player isn't online in L2J, the
+    // session is refused.
+    uint32_t player_id;
 };
 
 Config DefaultConfig();

@@ -34,6 +34,7 @@ final class ValidateHttpServer {
     private final String bind;
     private final int port;
     private final TokenIssuer tokens;
+    private L2WorldRef worldRef;
     private HttpServer server;
 
     ValidateHttpServer(String bind, int port, TokenIssuer tokens) {
@@ -44,8 +45,16 @@ final class ValidateHttpServer {
 
     void start() {
         try {
+            worldRef = new L2WorldRef();
+        } catch (Throwable t) {
+            // Running outside the GS JVM (e.g. smoke test). /voice/check
+            // will respond with online=false rather than 500.
+            log.warning("L2WorldRef bind failed; /voice/check will report offline only: " + t);
+        }
+        try {
             server = HttpServer.create(new InetSocketAddress(bind, port), 0);
-            server.createContext("/voice/validate", this::handle);
+            server.createContext("/voice/validate", this::handleValidate);
+            server.createContext("/voice/check",    this::handleCheck);
             server.setExecutor(null);     // single thread; load is trivial
             server.start();
             log.info("validate HTTP server listening on " + bind + ":" + port);
@@ -58,7 +67,7 @@ final class ValidateHttpServer {
         if (server != null) server.stop(1);
     }
 
-    private void handle(HttpExchange ex) throws IOException {
+    private void handleValidate(HttpExchange ex) throws IOException {
         if (!"POST".equalsIgnoreCase(ex.getRequestMethod())) {
             respond(ex, 405, "{\"valid\":false,\"reason\":\"method_not_allowed\"}");
             return;
@@ -82,6 +91,52 @@ final class ValidateHttpServer {
         String body200 = "{\"valid\":true,\"session_id\":" + sessionId +
                 ",\"player\":{\"player_id\":" + playerId + "}}";
         respond(ex, 200, body200);
+    }
+
+    /**
+     * GET /voice/check?player_id=N
+     *
+     * Lightweight liveness check used by the voice-service stub-auth:
+     * "is this player_id currently online in L2World?" Returns 200 with
+     *   {"online":true|false,"player_id":N}
+     * regardless of outcome — voice-service decides what to do with the
+     * answer. No HMAC, no nonce; the binding here is "if the player is
+     * actually logged in on the GS, accept their voice session".
+     */
+    private void handleCheck(HttpExchange ex) throws IOException {
+        if (!"GET".equalsIgnoreCase(ex.getRequestMethod())) {
+            respond(ex, 405, "{\"online\":false,\"reason\":\"method_not_allowed\"}");
+            return;
+        }
+        String q = ex.getRequestURI().getRawQuery();
+        int pid = parseQueryInt(q, "player_id");
+        if (pid == 0) {
+            respond(ex, 400, "{\"online\":false,\"reason\":\"missing_player_id\"}");
+            return;
+        }
+        boolean online = false;
+        if (worldRef != null) {
+            try { online = worldRef.containsPlayer(pid); }
+            catch (Throwable t) {
+                log.log(Level.WARNING, "containsPlayer failed", t);
+            }
+        }
+        respond(ex, 200, "{\"online\":" + online + ",\"player_id\":" + pid + "}");
+    }
+
+    private static int parseQueryInt(String q, String key) {
+        if (q == null) return 0;
+        for (String pair : q.split("&")) {
+            int eq = pair.indexOf('=');
+            if (eq < 0) continue;
+            String k = pair.substring(0, eq);
+            String v = pair.substring(eq + 1);
+            if (k.equals(key)) {
+                try { return Integer.parseInt(v); }
+                catch (NumberFormatException nfe) { return 0; }
+            }
+        }
+        return 0;
     }
 
     private static void respond(HttpExchange ex, int code, String body) throws IOException {

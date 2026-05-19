@@ -108,6 +108,7 @@ Config DefaultConfig() {
     c.ptt_ally      = 'M';
     c.enabled       = true;
     c.auto_connect  = true;
+    c.player_id     = 0;
     return c;
 }
 
@@ -135,6 +136,7 @@ bool LoadConfigFromIni(const wchar_t* path, Config* out) {
     c.ptt_ally       = getI(L"ptt_ally",       c.ptt_ally);
     c.enabled        = getI(L"enabled", 1) != 0;
     c.auto_connect   = getI(L"auto_connect", 1) != 0;
+    c.player_id      = (uint32_t)getI(L"player_id", 0);
     *out = c;
     return true;
 }
@@ -157,9 +159,17 @@ bool Init(const Config& cfg) {
         g_mod.net.Start(cfg.ws_url,
                         [](uint32_t /*sid*/, const char*, uint16_t) {},
                         &OnIncomingPacket);
-        // No client-side token. The DLL waits for SetAuthToken to be
-        // called from the chat sentinel hook (engine.dll chat-receive),
-        // which delivers the token L2J minted at EnterWorld.
+        // Send auth with the configured player_id. The voice-service
+        // validates via the L2J bridge /voice/check — no token needed
+        // when stub-auth is wired against the bridge. If player_id is
+        // 0 (default), the WS auth still goes through but the bridge
+        // will reject it as not-online; useful to confirm the path.
+        //
+        // TEMP — task #29: when g_localUser->ObjectId is mapped, the
+        // DLL will read player_id from memory and ignore the ini.
+        if (cfg.player_id != 0) {
+            g_mod.net.SetAuthToken("", cfg.player_id);
+        }
     }
 
     g_mod.running.store(true);

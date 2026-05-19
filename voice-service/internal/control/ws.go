@@ -11,6 +11,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"sync"
@@ -19,6 +21,14 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/luannbr/l2voice/voice-service/internal/topology"
 )
+
+// CheckEndpoint is the URL of the L2J bridge /voice/check endpoint.
+// Empty disables the check (stub-auth accepts any player_id). Set
+// from main.go via SetCheckEndpoint.
+var checkEndpoint string
+
+// SetCheckEndpoint configures the L2J bridge URL. Called once at startup.
+func SetCheckEndpoint(url string) { checkEndpoint = url }
 
 // authMsg is the first message a client must send.
 type authMsg struct {
@@ -105,7 +115,23 @@ func handleWS(ctx context.Context, w http.ResponseWriter, r *http.Request, state
 		return
 	}
 
-	// MVP stub: accept any token. Allocate session.
+	// Identity check against the L2J bridge: is this player_id currently
+	// online in L2World? If the bridge isn't configured (dev / no GS),
+	// accept any player_id — useful for loopback and bench tests.
+	if checkEndpoint != "" {
+		ok, err := checkPlayerOnline(msg.PlayerID)
+		if err != nil {
+			log.Printf("control: /voice/check error for player=%d: %v", msg.PlayerID, err)
+			_ = conn.WriteJSON(authFail{Type: "auth_fail", Reason: "validate_error"})
+			return
+		}
+		if !ok {
+			log.Printf("control: %s rejected — player %d not online", r.RemoteAddr, msg.PlayerID)
+			_ = conn.WriteJSON(authFail{Type: "auth_fail", Reason: "player_not_online"})
+			return
+		}
+	}
+
 	sess := state.AllocSession(msg.PlayerID)
 	defer state.Drop(sess.ID)
 
@@ -173,4 +199,29 @@ func indexLastByte(s string, b byte) int {
 		}
 	}
 	return -1
+}
+
+// checkPlayerOnline calls the L2J bridge to verify the player_id is
+// currently in L2World. Short timeout — auth is on the hot path of
+// a connect, the client is waiting.
+func checkPlayerOnline(playerID uint32) (bool, error) {
+	client := http.Client{Timeout: 2 * time.Second}
+	url := fmt.Sprintf("%s?player_id=%d", checkEndpoint, playerID)
+	resp, err := client.Get(url)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return false, fmt.Errorf("status %d: %s", resp.StatusCode, body)
+	}
+	var out struct {
+		Online   bool   `json:"online"`
+		PlayerID uint32 `json:"player_id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return false, err
+	}
+	return out.Online, nil
 }
