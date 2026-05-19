@@ -1,0 +1,6 @@
+node_modules/
+*.exe
+build/
+voice-service/voice-server
+voice-service/voice-server.exe
+target/

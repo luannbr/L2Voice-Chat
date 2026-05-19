@@ -1,0 +1,115 @@
+# Projeto: Sistema de Voz Integrado para Lineage 2 (extensão da DLL existente)
+
+## Contexto
+
+Já existe uma DLL injetada no cliente do Lineage 2 que implementa **AutoLogin com Overlay**. Ela já tem:
+- Hook gráfico funcional (D3D8/D3D9) com renderização de overlay
+- Sistema de input capturado pela DLL
+- Acesso à memória do cliente para ler/escrever estado do jogo
+- Pipeline de injeção e inicialização estável
+
+A tarefa é **estender essa DLL** para adicionar um sistema de voz integrado ao jogo, junto com o serviço de backend e a integração com o servidor L2J.
+
+## Objetivo final
+
+Sistema de voz com três canais simultâneos:
+1. **Proximity** — áudio posicional 3D, volume decai com distância (full até 5m, zera em 25m), respeita `instanceId`
+2. **Party** — canal fechado entre membros do grupo, com modo "open" que vaza para proximity
+3. **Clan / Aliança** — canais globais entre membros, independente de distância
+
+Cada canal tem PTT (push-to-talk) próprio, volume individual e mute por jogador.
+
+## Arquitetura a implementar
+
+```
+┌─────────────────────┐         ┌──────────────────────┐         ┌─────────────┐
+│  Cliente L2 + DLL   │◄───────►│  Serviço de Voz (Go) │◄───────►│   L2J Core  │
+│  (C++ existente)    │  UDP    │   SFU + Mixer        │  Redis  │  (Java)     │
+│                     │  audio  │                      │  pub/sub│             │
+│  + módulo voz novo  │  WS     │                      │         │  + módulo   │
+│                     │  ctrl   │                      │         │  publisher  │
+└─────────────────────┘         └──────────────────────┘         └─────────────┘
+```
+
+## Stack técnica
+
+- **Cliente (DLL, C++):** integrar ao código existente. Adicionar Opus (codec), miniaudio (captura/playback WASAPI), enet ou socket UDP puro (áudio), libwebsockets ou similar (controle). GUI usa o ImGui já presente.
+- **Serviço de voz (Go):** novo serviço standalone. Pacotes: `pion/webrtc` (NÃO usar — UDP próprio), `gorilla/websocket`, `go-redis`. Estado em memória + Redis para sessões.
+- **L2J:** módulo Java que escuta eventos do core e publica via Redis pub/sub.
+
+## Tarefas, em ordem
+
+### Fase 1 — Estrutura base
+1. Criar repositório monorepo com três diretórios: `client/` (extensão da DLL), `voice-service/` (Go), `l2j-bridge/` (Java).
+2. Definir o **protocolo binário** entre DLL e serviço de voz:
+   - Pacote de áudio UDP: `[u8 version][u8 channel][u32 seq][u32 player_id][u16 opus_len][opus_payload]`
+   - Para proximity: incluir `[f32 x][f32 y][f32 z][u32 instance_id]` no header
+   - WebSocket de controle: JSON com eventos `auth`, `channel_join`, `channel_leave`, `mute`, `state_update`
+3. Documentar o protocolo em `docs/protocol.md` antes de codar.
+
+### Fase 2 — Módulo de voz no cliente
+1. Adicionar à DLL existente um módulo `voice/` com:
+   - `AudioCapture` (WASAPI via miniaudio, 48kHz mono, frames de 20ms)
+   - `AudioPlayback` (mixer próprio, áudio posicional client-side com atenuação por distância — fórmula linear entre `min_dist=5m` e `max_dist=25m`)
+   - `OpusEncoder/Decoder` (bitrate 24kbps, complexity 5, FEC ligado)
+   - `VoiceNetwork` (UDP para áudio + WS para controle)
+   - `MemoryReader` (lê posição X/Y/Z, heading, instanceId, partyId, clanId do char local — offsets configuráveis por chronicle em `config.ini`)
+2. Integrar com o overlay existente: adicionar painel de configurações (device, keybinds, volumes), indicador de canal ativo no HUD, ícone de microfone em world-space sobre chars falando (usar view-projection matrix do D3D já hookada).
+3. Keybinds default: `V`=proximity, `B`=party, `N`=clan, `M`=ally. Configurável via GUI.
+
+### Fase 3 — Serviço de voz em Go
+1. Servidor UDP que recebe pacotes de áudio e roteia.
+2. Servidor WebSocket para controle e sinalização.
+3. **Roteador de proximity**: ao receber pacote no canal proximity de player A, faz lookup espacial (kdtree ou grid simples 50x50m) de players no mesmo `instance_id` dentro do raio máximo. Envia pacote para cada um SEM remixar (client-side mixing).
+4. **Roteador de party/clan/ally**: lookup direto na topologia social mantida em memória, envia para membros.
+5. Subscriber Redis: consome eventos do L2J e atualiza topologia social em tempo real.
+6. Métricas em `/metrics` (Prometheus): pacotes/s, latência, jogadores ativos por canal.
+
+### Fase 4 — Bridge L2J
+1. Módulo Java que se anexa ao core do L2J (assumir L2J interlude/H5 — confirmar versão antes).
+2. Hooks nos eventos: `onPlayerLogin`, `onPlayerLogout`, `onPartyJoin`, `onPartyLeave`, `onClanJoin`, `onClanLeave`, `onAllyChange`, `onZoneEnter`, `onZoneExit`, `onDeath`, `onRevive`.
+3. Publica cada evento como JSON em canal Redis `l2voice:events`.
+4. Endpoint HTTP de autenticação: a DLL envia um token, L2J valida que o token pertence ao char logado e retorna um session_id que o serviço de voz aceita.
+
+### Fase 5 — Casos especiais
+1. **Olympiad**: ao entrar na zona, mutar tudo exceto canal de espectador (a definir).
+2. **Siege**: criar canal dinâmico `siege_<castle_id>` que jogadores participantes entram automaticamente.
+3. **Multibox**: detectar via PID/janela e suprimir loopback de áudio entre instâncias no mesmo PC.
+4. **Morte**: aplicar low-pass filter no áudio do jogador morto (efeito "fantasma") OU silenciar — configurável.
+
+## Restrições e regras
+
+- **NÃO quebrar o AutoLogin existente.** Toda a extensão deve ser modular, ativável por flag no config.
+- **NÃO usar bibliotecas com licença restritiva** (GPL forte). Opus é BSD, miniaudio é MIT/Unlicense — ok. ImGui MIT — ok.
+- **Latência alvo:** <150ms boca-a-ouvido em rede local, <250ms em internet típica brasileira.
+- **CPU no cliente:** módulo de voz não pode passar de 3% em um i5 médio.
+- **Banda:** ~30 kbps por jogador falando, downstream proporcional ao número de fontes audíveis.
+- **Antivírus:** preparar build com assinatura de código. Avisar quais funções podem disparar heurística (hooks, leitura de memória) e documentar.
+
+## Entregáveis por fase
+
+Cada fase deve terminar com:
+- Código compilando sem warnings (`/W4` no MSVC, `-Wall -Wextra` no GCC, `go vet` limpo)
+- Testes unitários onde fizer sentido (codec, roteamento, parser de protocolo)
+- Um teste de integração end-to-end manual documentado em `docs/testing.md`
+- README atualizado
+
+## Como começar
+
+1. Antes de escrever código, ler os arquivos existentes da DLL para entender:
+   - Como o hook do D3D está estruturado
+   - Como o ImGui está inicializado
+   - Como a leitura de memória do cliente está implementada
+   - Qual chronicle do L2 é o alvo
+2. Me fazer perguntas sobre qualquer coisa ambígua ANTES de começar a Fase 1.
+3. Propor o protocolo binário detalhado (Fase 1, item 2) e esperar aprovação antes de seguir.
+4. Trabalhar uma fase por vez. Não pular para frente.
+
+## Informações que preciso fornecer
+
+Antes de você começar, vou te passar:
+- [ ] Código atual da DLL (path do repositório)
+- [ ] Versão/chronicle do L2 alvo (Interlude / H5 / Classic / etc)
+- [ ] Versão do L2J em uso
+- [ ] Offsets conhecidos para leitura de memória do char local
+- [ ] Se existe proteção antibot ativa (SmartGuard, vGuard, outra) — isso muda a estratégia de injeção
