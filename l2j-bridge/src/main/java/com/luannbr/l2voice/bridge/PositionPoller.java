@@ -29,6 +29,12 @@ final class PositionPoller {
 
     /** Last-published snapshot per player to gate by delta. */
     private final Map<Integer, int[]> last = new HashMap<>();
+    /** Last-publish wall-clock-ms per player. Heartbeat publishes even
+     *  when the player isn't moving, so the voice-service eventually
+     *  learns their position even if it allocated the session AFTER
+     *  the first-sight publish. */
+    private final Map<Integer, Long> lastPublishMs = new HashMap<>();
+    private static final long HEARTBEAT_MS = 3000;
 
     PositionPoller(RedisPublisher pub, int hz, int minDelta) {
         this.pub      = pub;
@@ -93,13 +99,15 @@ final class PositionPoller {
 
     private void tickPlayer(int objectId, int x, int y, int z, int instanceId) {
         int[] prev = last.get(objectId);
-        // First sight of a player → always publish (voice-service needs a
-        // position before it can route any proximity audio for them).
-        // After that, throttle by minDelta.
-        if (prev != null && Math.abs(prev[0] - x) < minDelta
-                         && Math.abs(prev[1] - y) < minDelta
-                         && Math.abs(prev[2] - z) < minDelta
-                         && prev[3] == instanceId) {
+        long now = System.currentTimeMillis();
+        Long lastMs = lastPublishMs.get(objectId);
+        boolean heartbeatDue = lastMs == null || (now - lastMs) >= HEARTBEAT_MS;
+        boolean movedEnough = prev == null
+                || Math.abs(prev[0] - x) >= minDelta
+                || Math.abs(prev[1] - y) >= minDelta
+                || Math.abs(prev[2] - z) >= minDelta
+                || prev[3] != instanceId;
+        if (!heartbeatDue && !movedEnough) {
             return;
         }
         if (prev == null) {
@@ -107,6 +115,7 @@ final class PositionPoller {
         } else {
             prev[0] = x; prev[1] = y; prev[2] = z; prev[3] = instanceId;
         }
+        lastPublishMs.put(objectId, now);
         pub.publishPosition(objectId, x, y, z, instanceId);
         publishedThisTick++;
     }
