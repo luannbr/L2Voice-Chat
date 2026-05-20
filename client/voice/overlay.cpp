@@ -641,42 +641,40 @@ void DrawPanel() {
     }
 
     // ---- Minimize button drawn DIRECTLY on the title bar ----
-    // ImGui doesn't expose a "custom title-bar button" API, but we
-    // can render over the title bar's pixels via the window's draw
-    // list (which is the same layer the title was drawn into) and
-    // hit-test the rectangle manually. The button sits in the
-    // right corner of the title bar, where the close 'x' lives in
-    // other apps.
+    // ImGui doesn't expose a "custom title-bar button" API. We draw
+    // it ourselves: use the FOREGROUND drawlist (no per-window clip
+    // rect — GetWindowDrawList clips to the content area below the
+    // title bar, so anything drawn at title-bar Y disappears).
+    // Hit-test the rectangle manually with IsMouseHoveringRect.
     {
         ImGuiStyle& s = ImGui::GetStyle();
         const float titleH = ImGui::GetFontSize() + s.FramePadding.y * 2;
         ImVec2 winP   = ImGui::GetWindowPos();
         float  winW   = ImGui::GetWindowWidth();
         const float btnSz = titleH - 4;
-        ImVec2 btnMin(winP.x + winW - btnSz - 4, winP.y + 2);
+        ImVec2 btnMin(winP.x + winW - btnSz - 6, winP.y + 2);
         ImVec2 btnMax(btnMin.x + btnSz, btnMin.y + btnSz);
         bool hovered = ImGui::IsMouseHoveringRect(btnMin, btnMax);
-        bool clicked = hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
-        if (clicked) g_minimized.store(true);
+        if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            g_minimized.store(true);
+        }
 
-        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ImDrawList* dl = ImGui::GetForegroundDrawList();
         ImU32 bg = hovered
             ? IM_COL32(0xd4, 0xaf, 0x37, 0x55)
-            : IM_COL32(0, 0, 0, 0);
-        if (bg) dl->AddRectFilled(btnMin, btnMax, bg, 2.0f);
+            : IM_COL32(0x2a, 0x1f, 0x15, 0xff);
+        dl->AddRectFilled(btnMin, btnMax, bg, 2.0f);
+        ImU32 border = IM_COL32(0x8b, 0x69, 0x14, 0xff);
+        dl->AddRect(btnMin, btnMax, border, 2.0f, 0, 1.0f);
         ImU32 fg = hovered
             ? IM_COL32(0xff, 0xd6, 0x60, 0xff)
             : IM_COL32(0xd4, 0xaf, 0x37, 0xff);
-        // Centered "_" — manually drawn line for crisp positioning
-        // (text "_" floats too low at the title-bar baseline).
-        float midY = (btnMin.y + btnMax.y) * 0.5f + btnSz * 0.25f;
+        // "_" drawn as a horizontal gold line at the bottom of the box
+        // (a real underscore glyph baseline-floats too low at the
+        // title-bar height).
+        float midY = btnMax.y - 4;
         dl->AddLine(ImVec2(btnMin.x + 4, midY),
                     ImVec2(btnMax.x - 4, midY), fg, 2.0f);
-
-        // If the user clicked our button area, ImGui still thinks
-        // the title bar handled the click for dragging. That's OK —
-        // setting g_minimized swaps to icon mode on next frame
-        // regardless of any drag attempt.
     }
 
     // ====== Session + player name ======

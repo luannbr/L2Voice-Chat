@@ -1,115 +1,238 @@
-# Projeto: Sistema de Voz Integrado para Lineage 2 (extensão da DLL existente)
+# Projeto: Clan System Voice — Sistema de Voz Hierárquico para Lineage 2
 
 ## Contexto
 
-Já existe uma DLL injetada no cliente do Lineage 2 que implementa **AutoLogin com Overlay**. Ela já tem:
-- Hook gráfico funcional (D3D8/D3D9) com renderização de overlay
-- Sistema de input capturado pela DLL
-- Acesso à memória do cliente para ler/escrever estado do jogo
-- Pipeline de injeção e inicialização estável
+Já existe uma DLL injetada no cliente do Lineage 2 com AutoLogin + Overlay funcional (hook D3D, ImGui, leitura de memória do cliente). Esta tarefa adiciona um **sistema de voz com hierarquia de clan** ao projeto existente. Assume-se que a infraestrutura base (DLL no cliente, serviço de voz em Go, bridge L2J) já foi planejada em fases anteriores. Esta especificação cobre **apenas a camada de regras de canais e permissões**.
 
-A tarefa é **estender essa DLL** para adicionar um sistema de voz integrado ao jogo, junto com o serviço de backend e a integração com o servidor L2J.
+## Conceitos-chave
 
-## Objetivo final
+O sistema tem **4 canais** que o jogador pode ouvir/falar simultaneamente:
+- `PROXIMITY` — áudio posicional 3D, jogadores próximos no mesmo `instanceId`
+- `PARTY` — membros do grupo atual
+- `CLAN` — membros do clan
+- `ALLY` — membros da aliança (todos os clans aliados)
 
-Sistema de voz com três canais simultâneos:
-1. **Proximity** — áudio posicional 3D, volume decai com distância (full até 5m, zera em 25m), respeita `instanceId`
-2. **Party** — canal fechado entre membros do grupo, com modo "open" que vaza para proximity
-3. **Clan / Aliança** — canais globais entre membros, independente de distância
+Cada canal tem uma aba na GUI com:
+- Toggle **Ativado / Desativado** (default: ativado)
+- Slider de **volume** (0–100%)
+- Lista de jogadores no canal com **mute individual** e **volume individual**
 
-Cada canal tem PTT (push-to-talk) próprio, volume individual e mute por jogador.
+## REGRAS DE NEGÓCIO (ler com atenção, são a parte mais importante)
 
-## Arquitetura a implementar
+### Regra 1 — Toggle "Desativado" por canal
+
+Quando o jogador desativa um canal:
+- Ele **não ouve mais nada** desse canal
+- Ele **continua podendo falar** nesse canal (transmissão é independente da escuta)
+- Exceção: **lideres/sub-lideres de clan ignoram esse toggle no canal CLAN e ALLY** (ver Regra 3)
+
+### Regra 2 — Hierarquia do Clan
+
+Cada clan tem:
+- **1 Líder** (definido pelo L2J, leitura via bridge)
+- **N Sub-líderes** (atribuídos pelo Líder dentro da nossa GUI — NÃO é o sistema de ranks nativo do L2, é controle nosso)
+
+O Líder tem um painel "Gerenciar Sub-líderes" onde adiciona/remove membros do clan como sub-líder. Persistência via serviço de voz (banco próprio, não L2J).
+
+Na GUI da aba CLAN, líder e sub-líderes aparecem em um **campo separado no topo** (visualmente destacado), e os membros comuns abaixo.
+
+### Regra 3 — "Override" do líder/sub-líder
+
+Quando um líder ou sub-líder fala no canal CLAN (ou ALLY, se houver aliança):
+- O áudio dele **ignora o toggle "Desativado"** dos membros — todos ouvem mesmo que tenham desativado o canal
+- O áudio **NÃO ignora**:
+  - Mute individual aplicado especificamente naquele líder (cada jogador pode mutar líder X se quiser)
+  - Volume individual baixado/zerado especificamente naquele líder
+  
+Ou seja: o jogador comum não consegue "desligar o canal inteiro" para escapar do líder, mas **consegue silenciar o líder específico** se quiser. Decisão deliberada.
+
+### Regra 4 — Modo "Whisper" do líder
+
+Líder e sub-líderes têm uma opção **"Whisper Mode"** na GUI:
+- **Desligado (default):** fala normal — só transmite quando segura a tecla de PTT do canal
+- **Ligado em PTT:** ao pressionar uma tecla designada específica do whisper (ex: `H`), a fala vai para TODOS os membros do clan, ignorando "Desativado" deles (Regra 3 se aplica)
+- **Ligado em "sempre aberto":** o microfone fica aberto continuamente nesse modo whisper-clan, sem precisar segurar tecla
+
+Whisper é um modo de transmissão, não um canal separado. Funciona no canal CLAN (e ALLY se aplicável).
+
+### Regra 5 — Mute remoto pelo líder/sub-líder
+
+Líder e sub-líderes podem **silenciar/dessilenciar temporariamente o microfone** de qualquer membro:
+- Vale apenas nos canais **CLAN e ALLY**
+- **NÃO vale para PARTY e PROXIMITY** — nesses, o membro continua transmitindo normalmente mesmo se mutado no clan
+- O mute é **temporário** (sessão atual; expira no logout do alvo ou ao ser desfeito)
+- O membro mutado vê na GUI um indicador "Você foi silenciado no clan por [nome]"
+- Sub-líder só pode mutar membros comuns, **não pode mutar o líder nem outros sub-líderes**
+- Líder pode mutar qualquer um, incluindo sub-líderes
+
+### Regra 6 — Modos de operação do clan (PVP / SIEGE / BOSS / FARM)
+
+Apenas líder e sub-líderes têm acesso a um seletor de **"Modo do Clan"** na GUI. Modos disponíveis:
+- `NONE` (default)
+- `PVP`
+- `SIEGE`
+- `BOSS`
+- `FARM`
+
+Quando um líder/sub-líder ativa qualquer modo diferente de NONE:
+- **Todos os membros do clan + ally entram num "canal unificado de modo"** — falam e ouvem entre si livremente, sem PTT separado entre clan e ally (vira um canal só temporariamente)
+- O canal de modo **sobrepõe os canais CLAN e ALLY normais** enquanto ativo
+- A Regra 3 (override do líder) continua válida
+- **Jogadores próximos que NÃO sejam do clan/ally NÃO OUVEM esse áudio** — mesmo estando no raio de proximity. O áudio do canal de modo é totalmente isolado do PROXIMITY.
+- Apenas um modo ativo por vez por clan. Trocar modo desativa o anterior.
+- Apenas quem ativou (ou um superior na hierarquia) pode desativar.
+
+Cada modo pode ter cores/ícones diferentes na GUI para indicar visualmente o estado, mas a lógica de áudio é a mesma para os 4 modos. Os nomes (PVP/SIEGE/BOSS/FARM) são labels organizacionais.
+
+### Regra 7 — Canal PARTY
+
+- Todos os membros da party falam e ouvem livremente
+- Continua ouvindo **CLAN e ALLY** simultaneamente (se membro deles)
+- Continua ouvindo **PROXIMITY** simultaneamente
+- Party não tem hierarquia, não tem override, não tem modo. É plano.
+- Se um modo de clan está ativo (Regra 6), o áudio do modo continua sendo ouvido em paralelo à party. Party não é silenciada por modo de clan.
+
+### Regra 8 — Canal PROXIMITY
+
+- Áudio posicional 3D normal, com atenuação por distância
+- Respeita `instanceId` (instâncias separadas não se ouvem mesmo na mesma coordenada)
+- **NÃO é afetado** por mute remoto do clan (Regra 5)
+- **NÃO ouve** áudio de modo de clan (Regra 6) — terceiros próximos não escapam para o canal isolado
+
+## Matriz de decisão de roteamento (para o serviço de voz)
+
+Para cada pacote de áudio recebido do jogador A no canal C, o serviço decide para quem rotear assim:
 
 ```
-┌─────────────────────┐         ┌──────────────────────┐         ┌─────────────┐
-│  Cliente L2 + DLL   │◄───────►│  Serviço de Voz (Go) │◄───────►│   L2J Core  │
-│  (C++ existente)    │  UDP    │   SFU + Mixer        │  Redis  │  (Java)     │
-│                     │  audio  │                      │  pub/sub│             │
-│  + módulo voz novo  │  WS     │                      │         │  + módulo   │
-│                     │  ctrl   │                      │         │  publisher  │
-└─────────────────────┘         └──────────────────────┘         └─────────────┘
+Se C == PROXIMITY:
+  → todos players no mesmo instanceId, raio ≤ max_dist, que tenham PROXIMITY ativado
+  → aplicar mute individual e volume individual
+
+Se C == PARTY:
+  → todos membros da party de A que tenham PARTY ativado
+  → líder/sub-líder NÃO tem override aqui
+
+Se C == CLAN (modo normal):
+  → todos membros do clan de A
+  → se A é líder ou sub-líder: ignorar toggle "Desativado" dos receptores
+  → respeitar mute individual e volume individual de cada receptor sobre A
+  → se A está mutado remotamente pelo líder → não rotear
+
+Se C == ALLY (modo normal):
+  → idem CLAN, mas escopo é todos os clans da aliança
+
+Se modo de clan ativo (PVP/SIEGE/BOSS/FARM) e A está no clan ou ally:
+  → roteia para todos membros do clan + ally, ignorando toggles
+  → NÃO roteia para PROXIMITY de não-membros
+  → este pacote substitui CLAN/ALLY normal enquanto modo ativo
+
+Se A é líder/sub-líder e Whisper ativo:
+  → força roteamento como CLAN com override, mesmo que A não tenha pressionado PTT do canal CLAN
+  → se "sempre aberto", roteia continuamente sem PTT
 ```
 
-## Stack técnica
+## GUI — Estrutura das abas
 
-- **Cliente (DLL, C++):** integrar ao código existente. Adicionar Opus (codec), miniaudio (captura/playback WASAPI), enet ou socket UDP puro (áudio), libwebsockets ou similar (controle). GUI usa o ImGui já presente.
-- **Serviço de voz (Go):** novo serviço standalone. Pacotes: `pion/webrtc` (NÃO usar — UDP próprio), `gorilla/websocket`, `go-redis`. Estado em memória + Redis para sessões.
-- **L2J:** módulo Java que escuta eventos do core e publica via Redis pub/sub.
+```
+┌─ [PROXIMITY] [PARTY] [CLAN] [ALLY] ──────────────────┐
+│                                                       │
+│  [✓] Ativado          Volume: [====------] 60%       │
+│                                                       │
+│  ┌─ Líderes / Sub-líderes ──────────────────────┐    │   (só nas abas CLAN/ALLY)
+│  │ 👑 LeaderName    [🔊] [Vol:===]  [Mute]      │    │
+│  │ ⭐ SubLeader1    [🔊] [Vol:===]  [Mute]      │    │
+│  └──────────────────────────────────────────────┘    │
+│                                                       │
+│  ┌─ Membros ────────────────────────────────────┐    │
+│  │   Player1        [🔊] [Vol:===]  [Mute]      │    │
+│  │   Player2        [🔇] [Vol:---]  [Unmute]    │    │
+│  │   ...                                         │    │
+│  └──────────────────────────────────────────────┘    │
+│                                                       │
+│  [Painel Líder — só visível se for líder/sub]        │
+│  Modo: ( ) None  ( ) PVP  ( ) Siege  (●) Boss  ( ) Farm │
+│  [✓] Whisper Mode    Tecla: [H]    [ ] Sempre aberto │
+│  [Gerenciar Sub-líderes]  (só líder)                 │
+└───────────────────────────────────────────────────────┘
+```
 
-## Tarefas, em ordem
+## Tarefas de implementação
 
-### Fase 1 — Estrutura base
-1. Criar repositório monorepo com três diretórios: `client/` (extensão da DLL), `voice-service/` (Go), `l2j-bridge/` (Java).
-2. Definir o **protocolo binário** entre DLL e serviço de voz:
-   - Pacote de áudio UDP: `[u8 version][u8 channel][u32 seq][u32 player_id][u16 opus_len][opus_payload]`
-   - Para proximity: incluir `[f32 x][f32 y][f32 z][u32 instance_id]` no header
-   - WebSocket de controle: JSON com eventos `auth`, `channel_join`, `channel_leave`, `mute`, `state_update`
-3. Documentar o protocolo em `docs/protocol.md` antes de codar.
+### Fase A — Modelo de dados e estado
+1. Definir estruturas no serviço de voz (Go):
+   - `Player { id, clan_id, ally_id, party_id, instance_id, pos, role: MEMBER|SUB_LEADER|LEADER }`
+   - `Clan { id, leader_id, sub_leaders: Set<player_id>, mode: NONE|PVP|SIEGE|BOSS|FARM, mode_set_by }`
+   - `RemoteMutes { (muter_id, target_id, scope: CLAN|ALLY, expires_at) }`
+   - `PlayerPrefs { channel_enabled: map<channel, bool>, channel_volume: map<channel, float>, per_player_mute: Set<player_id>, per_player_volume: map<player_id, float>, whisper_mode: NONE|PTT|ALWAYS_OPEN, whisper_key }`
+2. Persistência: sub-líderes e prefs em SQLite (arquivo local do serviço). Mutes remotos só em memória (sessão).
+3. Sincronizar `clan_id`, `ally_id`, `party_id`, `role` (LEADER) via Redis pub/sub do L2J bridge. Sub-leader é controle nosso, não vem do L2J.
 
-### Fase 2 — Módulo de voz no cliente
-1. Adicionar à DLL existente um módulo `voice/` com:
-   - `AudioCapture` (WASAPI via miniaudio, 48kHz mono, frames de 20ms)
-   - `AudioPlayback` (mixer próprio, áudio posicional client-side com atenuação por distância — fórmula linear entre `min_dist=5m` e `max_dist=25m`)
-   - `OpusEncoder/Decoder` (bitrate 24kbps, complexity 5, FEC ligado)
-   - `VoiceNetwork` (UDP para áudio + WS para controle)
-   - `MemoryReader` (lê posição X/Y/Z, heading, instanceId, partyId, clanId do char local — offsets configuráveis por chronicle em `config.ini`)
-2. Integrar com o overlay existente: adicionar painel de configurações (device, keybinds, volumes), indicador de canal ativo no HUD, ícone de microfone em world-space sobre chars falando (usar view-projection matrix do D3D já hookada).
-3. Keybinds default: `V`=proximity, `B`=party, `N`=clan, `M`=ally. Configurável via GUI.
+### Fase B — Roteador
+1. Implementar a matriz de decisão da seção anterior como função pura `route(packet, sender, world_state) → []receiver_id`.
+2. Cobrir com testes unitários todos os casos:
+   - Membro fala em CLAN normal → membros com CLAN ativado recebem
+   - Líder fala em CLAN → membros com CLAN desativado também recebem
+   - Líder fala em CLAN → membro que mutou o líder NÃO recebe
+   - Modo SIEGE ativo + jogador comum perto de não-membro → não-membro não ouve
+   - Sub-líder tenta mutar líder → operação rejeitada
+   - Membro mutado remotamente fala em PARTY → outros membros da party OUVEM (mute remoto não afeta party)
+3. Testes de propriedade (property-based): aplicar sequências aleatórias de eventos e checar invariantes (ex: PROXIMITY nunca recebe áudio de canal de modo).
 
-### Fase 3 — Serviço de voz em Go
-1. Servidor UDP que recebe pacotes de áudio e roteia.
-2. Servidor WebSocket para controle e sinalização.
-3. **Roteador de proximity**: ao receber pacote no canal proximity de player A, faz lookup espacial (kdtree ou grid simples 50x50m) de players no mesmo `instance_id` dentro do raio máximo. Envia pacote para cada um SEM remixar (client-side mixing).
-4. **Roteador de party/clan/ally**: lookup direto na topologia social mantida em memória, envia para membros.
-5. Subscriber Redis: consome eventos do L2J e atualiza topologia social em tempo real.
-6. Métricas em `/metrics` (Prometheus): pacotes/s, latência, jogadores ativos por canal.
+### Fase C — Protocolo
+Estender o WebSocket de controle com mensagens:
+- `set_channel_enabled { channel, enabled }`
+- `set_channel_volume { channel, volume }`
+- `set_player_mute { target_id, muted }`
+- `set_player_volume { target_id, volume }`
+- `clan_promote_subleader { target_id }` (só líder)
+- `clan_demote_subleader { target_id }` (só líder)
+- `clan_remote_mute { target_id, muted, scope }` (só líder/sub)
+- `clan_set_mode { mode }` (só líder/sub)
+- `whisper_set { mode, key }` (só líder/sub)
+- Server → client: `notification { type: "remotely_muted_by", from }`, `clan_mode_changed { mode, by }`, `subleader_changed { target, promoted }`
 
-### Fase 4 — Bridge L2J
-1. Módulo Java que se anexa ao core do L2J (assumir L2J interlude/H5 — confirmar versão antes).
-2. Hooks nos eventos: `onPlayerLogin`, `onPlayerLogout`, `onPartyJoin`, `onPartyLeave`, `onClanJoin`, `onClanLeave`, `onAllyChange`, `onZoneEnter`, `onZoneExit`, `onDeath`, `onRevive`.
-3. Publica cada evento como JSON em canal Redis `l2voice:events`.
-4. Endpoint HTTP de autenticação: a DLL envia um token, L2J valida que o token pertence ao char logado e retorna um session_id que o serviço de voz aceita.
+Validar autorização em CADA mensagem no servidor. Cliente não é fonte de verdade.
 
-### Fase 5 — Casos especiais
-1. **Olympiad**: ao entrar na zona, mutar tudo exceto canal de espectador (a definir).
-2. **Siege**: criar canal dinâmico `siege_<castle_id>` que jogadores participantes entram automaticamente.
-3. **Multibox**: detectar via PID/janela e suprimir loopback de áudio entre instâncias no mesmo PC.
-4. **Morte**: aplicar low-pass filter no áudio do jogador morto (efeito "fantasma") OU silenciar — configurável.
+### Fase D — GUI na DLL
+1. Estender o overlay ImGui existente com a estrutura de abas mostrada acima.
+2. Mostrar/esconder painéis condicionalmente baseado em `role` do jogador local.
+3. Indicador visual de modo ativo (banner no topo da tela com cor: PVP=vermelho, SIEGE=roxo, BOSS=laranja, FARM=verde).
+4. Notificação toast quando o jogador é mutado remotamente.
+5. Keybind do whisper configurável via GUI.
 
-## Restrições e regras
+### Fase E — Bridge L2J
+Confirmar que o bridge publica:
+- `clan_join`, `clan_leave`, `clan_leader_change`, `ally_join`, `ally_leave`, `party_change` em tempo real
 
-- **NÃO quebrar o AutoLogin existente.** Toda a extensão deve ser modular, ativável por flag no config.
-- **NÃO usar bibliotecas com licença restritiva** (GPL forte). Opus é BSD, miniaudio é MIT/Unlicense — ok. ImGui MIT — ok.
-- **Latência alvo:** <150ms boca-a-ouvido em rede local, <250ms em internet típica brasileira.
-- **CPU no cliente:** módulo de voz não pode passar de 3% em um i5 médio.
-- **Banda:** ~30 kbps por jogador falando, downstream proporcional ao número de fontes audíveis.
-- **Antivírus:** preparar build com assinatura de código. Avisar quais funções podem disparar heurística (hooks, leitura de memória) e documentar.
+Sub-leader é nosso, não precisa de bridge.
 
-## Entregáveis por fase
+## Restrições
 
-Cada fase deve terminar com:
-- Código compilando sem warnings (`/W4` no MSVC, `-Wall -Wextra` no GCC, `go vet` limpo)
-- Testes unitários onde fizer sentido (codec, roteamento, parser de protocolo)
-- Um teste de integração end-to-end manual documentado em `docs/testing.md`
-- README atualizado
+- **Servidor é a fonte de verdade.** Cliente nunca decide se pode mutar ou trocar modo. Sempre valida no Go.
+- **Sub-leader é nosso conceito**, separado do rank nativo do L2. Documentar isso claramente.
+- **Modo de clan é exclusivo no escopo do clan**: clans diferentes podem ter modos diferentes ativos ao mesmo tempo, são isolados.
+- **Não permitir bypass via cliente modificado**: todas as regras de override, mute remoto e modo são checadas no servidor. Cliente só renderiza.
+- **Performance**: roteador deve resolver receivers em O(N) no número de membros do clan/ally, não O(N²). Usar índices em memória.
+- **Latência adicional do roteamento**: <5ms p99.
 
 ## Como começar
 
-1. Antes de escrever código, ler os arquivos existentes da DLL para entender:
-   - Como o hook do D3D está estruturado
-   - Como o ImGui está inicializado
-   - Como a leitura de memória do cliente está implementada
-   - Qual chronicle do L2 é o alvo
-2. Me fazer perguntas sobre qualquer coisa ambígua ANTES de começar a Fase 1.
-3. Propor o protocolo binário detalhado (Fase 1, item 2) e esperar aprovação antes de seguir.
-4. Trabalhar uma fase por vez. Não pular para frente.
+1. Ler o código atual da DLL e do serviço de voz para entender:
+   - Como o overlay ImGui está estruturado (onde adicionar as abas)
+   - Como o WebSocket de controle está implementado
+   - Como o estado de clan/party é hoje sincronizado do L2J
+2. Confirmar comigo:
+   - [ ] Sub-leader é controle nosso (não usa rank do L2)? **Sim, é nosso.**
+   - [ ] Limite de sub-leaders por clan? Sugestão: 5. Confirmar.
+   - [ ] Modo é "exclusivo por clan" ou pode coexistir com modo da aliança? Sugestão: cada clan tem seu modo independente, e quando há ally, apenas o líder do clan principal define o modo unificado. Confirmar regra.
+   - [ ] Whisper "sempre aberto" tem alguma proteção contra esquecer o mic ligado? (ex: timeout, indicador piscando). Sugestão: indicador grande e piscando no HUD do próprio líder.
+3. Propor o esquema de dados final e a matriz de roteamento detalhada antes de codar.
+4. Trabalhar fase por fase: A → B → C → D → E. Não pular.
 
-## Informações que preciso fornecer
+## Critérios de "pronto"
 
-Antes de você começar, vou te passar:
-- [ ] Código atual da DLL (path do repositório)
-- [ ] Versão/chronicle do L2 alvo (Interlude / H5 / Classic / etc)
-- [ ] Versão do L2J em uso
-- [ ] Offsets conhecidos para leitura de memória do char local
-- [ ] Se existe proteção antibot ativa (SmartGuard, vGuard, outra) — isso muda a estratégia de injeção
+- Todos os casos da matriz de decisão cobertos por teste unitário
+- GUI renderiza corretamente em todas as combinações de role (membro / sub-líder / líder, com e sem ally)
+- Bypass tentado via cliente modificado é bloqueado pelo servidor (teste manual com pacote forjado)
+- Líder consegue ativar modo SIEGE e jogador não-membro próximo confirma que não ouve nada
+- Membro mutado em CLAN consegue falar normalmente em PARTY e PROXIMITY
