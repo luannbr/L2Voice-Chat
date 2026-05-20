@@ -22,10 +22,16 @@ type Session struct {
 	LastSeen   time.Time    // last UDP/WS activity
 }
 
-// PositionKnown reports whether we have a recent (<2 s) position from L2J.
-// Used by the proximity router to decide whether to route at all.
+// PositionKnown reports whether we ever received a position for this
+// session from L2J. The session is dropped on WS disconnect or
+// player_logout, so a non-zero PosTime means the player IS in-world
+// at the cached coordinates — no need for a recency window. (Earlier
+// versions had a 2 s freshness gate, but PositionPoller throttles by
+// delta, so a player standing still goes silent on the bus and the
+// gate would falsely block proximity routing.)
 func (sess *Session) PositionKnown(now time.Time) bool {
-	return !sess.PosTime.IsZero() && now.Sub(sess.PosTime) < 2*time.Second
+	_ = now
+	return !sess.PosTime.IsZero()
 }
 
 // State is the global session table.
