@@ -105,6 +105,18 @@ set(USE_ZLIB     OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(ixwebsocket)
 
 # ---- the DLL --------------------------------------------------------
+# Generate the resource script with an absolute path to the PNG so
+# the RC compiler can find it at build time. Embedded into the DLL
+# binary — no external file needed at runtime.
+set(MIC_PNG_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../voice-recorder.png")
+file(TO_NATIVE_PATH "${MIC_PNG_PATH}" MIC_PNG_PATH)
+string(REPLACE "\\" "\\\\" MIC_PNG_PATH "${MIC_PNG_PATH}")
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/voice/resources.rc.in
+    ${CMAKE_CURRENT_BINARY_DIR}/l2voice_resources.rc
+    @ONLY
+)
+
 add_library(l2voice SHARED
     dllmain.cpp
     voice/voice.cpp
@@ -112,6 +124,7 @@ add_library(l2voice SHARED
     voice/opus_codec.cpp
     voice/voice_network.cpp
     voice/overlay.cpp
+    ${CMAKE_CURRENT_BINARY_DIR}/l2voice_resources.rc
 )
 
 target_include_directories(l2voice PRIVATE

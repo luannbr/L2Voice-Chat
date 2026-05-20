@@ -360,6 +360,24 @@ void VoiceNetwork::SendProximityFrame(uint16_t seq,
            (sockaddr*)&impl_->udp_dest, sizeof(impl_->udp_dest));
 }
 
+void VoiceNetwork::SendGroupFrame(uint8_t channel, uint16_t seq,
+                                  const uint8_t* opus, int opus_len) {
+    if (impl_->udp_port.load() == 0) return;
+    if (opus_len <= 0 || opus_len > 1024) return;
+    if (channel < 1 || channel > 3) return;
+    uint8_t pkt[1100];
+    pkt[0] = 1;                       // version
+    pkt[1] = channel;                 // 1=party, 2=clan, 3=ally
+    pkt[2] = (uint8_t)(seq & 0xFF);
+    pkt[3] = (uint8_t)((seq >> 8) & 0xFF);
+    uint32_t sid = impl_->session_id.load();
+    std::memcpy(pkt + 4, &sid, 4);
+    std::memcpy(pkt + 8, opus, opus_len);
+    int total = 8 + opus_len;
+    sendto(impl_->udp_sock, (const char*)pkt, total, 0,
+           (sockaddr*)&impl_->udp_dest, sizeof(impl_->udp_dest));
+}
+
 void VoiceNetwork::SendKeepalive() {
     if (impl_->udp_port.load() == 0) return;
     uint8_t pkt[8];

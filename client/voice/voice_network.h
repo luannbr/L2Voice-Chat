@@ -64,6 +64,13 @@ public:
     void SendProximityFrame(uint16_t seq,
                             const uint8_t* opus_payload, int opus_len);
 
+    // Send a group-voice (party/clan/ally) audio frame. channel must
+    // be 1 (party), 2 (clan), or 3 (ally). Wire format is the same
+    // 8-byte ingress header — voice-service resolves membership
+    // server-side via the bridge.
+    void SendGroupFrame(uint8_t channel, uint16_t seq,
+                        const uint8_t* opus_payload, int opus_len);
+
     // Send a keepalive (header-only) — call every 15s while
     // session_id is valid and not actively transmitting.
     void SendKeepalive();

@@ -19,14 +19,84 @@ package audio
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"math"
 	"net"
+	"net/http"
+	"sync"
 	"time"
 
 	"github.com/luannbr/l2voice/voice-service/internal/topology"
 )
+
+// L2J bridge /voice/group endpoint URL — set from main.go.
+var groupEndpoint string
+
+// SetGroupEndpoint wires the bridge URL for party/clan/ally lookups.
+func SetGroupEndpoint(url string) { groupEndpoint = url }
+
+// groupCache holds the last group-member lookup per (player_id, channel)
+// pair. Audio frames arrive at 50 Hz; without a cache that'd be 50 HTTP
+// hits per second per active speaker. The TTL is short enough that a
+// player joining/leaving a party hits the new state within ~3 s.
+type groupCacheKey struct {
+	playerID uint32
+	channel  uint8
+}
+type groupCacheEntry struct {
+	members []uint32
+	expires time.Time
+}
+
+var (
+	groupCacheMu sync.Mutex
+	groupCache   = map[groupCacheKey]groupCacheEntry{}
+)
+
+const groupCacheTTL = 3 * time.Second
+
+// lookupGroupMembers returns the player_ids that belong to the same
+// voice group as `speakerPID` for the given channel.
+func lookupGroupMembers(speakerPID uint32, channel uint8) ([]uint32, error) {
+	key := groupCacheKey{speakerPID, channel}
+	now := time.Now()
+	groupCacheMu.Lock()
+	if e, ok := groupCache[key]; ok && now.Before(e.expires) {
+		members := e.members
+		groupCacheMu.Unlock()
+		return members, nil
+	}
+	groupCacheMu.Unlock()
+
+	if groupEndpoint == "" {
+		return nil, fmt.Errorf("no group endpoint configured")
+	}
+	url := fmt.Sprintf("%s?player_id=%d&channel=%d",
+		groupEndpoint, speakerPID, channel)
+	client := http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("status %d", resp.StatusCode)
+	}
+	var body struct {
+		Members []uint32 `json:"members"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, err
+	}
+	groupCacheMu.Lock()
+	groupCache[key] = groupCacheEntry{members: body.Members,
+		expires: now.Add(groupCacheTTL)}
+	groupCacheMu.Unlock()
+	return body.Members, nil
+}
 
 const (
 	// Spatial parameters (could be made per-receiver later).
@@ -125,10 +195,11 @@ func Serve(ctx context.Context, udpAddr string, state *topology.State, cfg Confi
 		switch channel {
 		case chProximity:
 			routeProximity(seqLo, sid, buf[8:n], sess, state, conn, cfg)
+		case chParty, chClan, chAlly:
+			routeGroup(channel, seqLo, sid, buf[8:n], sess, state, conn)
 		case chKeepalive:
 			// LastSeen already touched on first packet via RememberUDP path.
 		case chPingReq:
-			// Reflect as ping_resp with same seq.
 			var out [8]byte
 			out[0] = 1
 			out[1] = chPingResp
@@ -136,7 +207,7 @@ func Serve(ctx context.Context, udpAddr string, state *topology.State, cfg Confi
 			binary.LittleEndian.PutUint32(out[4:8], sid)
 			conn.WriteToUDP(out[:], from)
 		default:
-			// party/clan/ally/siege not implemented in MVP — drop quietly.
+			// siege not implemented.
 		}
 	}
 }
@@ -227,5 +298,48 @@ func routeProximity(seqLo uint16, srcSID uint32, opus []byte,
 			log.Printf("audio:   -> recv sid=%d dist=%.0f gain=%d wrote=%d err=%v",
 				recv.ID, dist, out[8], n, werr)
 		}
+	}
+}
+
+// routeGroup forwards a party/clan/ally opus payload to every player
+// the bridge reports as belonging to the speaker's group. No spatial
+// math, no gain stamping — group voice is full-volume, mono. Packet
+// shape on egress matches the proximity channel (10 bytes header)
+// but gain/pan are always (255, 0) so the client mixes at unity gain.
+func routeGroup(channel uint8, seqLo uint16, srcSID uint32, opus []byte,
+	speaker *topology.Session, state *topology.State, conn *net.UDPConn) {
+
+	if len(opus) == 0 || speaker.PlayerID == 0 {
+		return
+	}
+	members, err := lookupGroupMembers(speaker.PlayerID, channel)
+	if err != nil {
+		if rxCount[srcSID]%50 == 1 {
+			log.Printf("audio: group lookup failed sid=%d ch=%d: %v",
+				srcSID, channel, err)
+		}
+		return
+	}
+	if rxCount[srcSID]%50 == 1 {
+		log.Printf("audio: sid=%d (pid=%d) ch=%d group=%d members",
+			srcSID, speaker.PlayerID, channel, len(members))
+	}
+	out := make([]byte, 10+len(opus))
+	out[0] = 1
+	out[1] = channel
+	binary.LittleEndian.PutUint16(out[2:4], seqLo)
+	binary.LittleEndian.PutUint32(out[4:8], srcSID)
+	out[8] = 255   // gain
+	out[9] = 0     // pan (centered)
+	copy(out[10:], opus)
+	for _, pid := range members {
+		if pid == speaker.PlayerID {
+			continue
+		}
+		recv := state.LookupByPlayer(pid)
+		if recv == nil || recv.UDPAddr == nil {
+			continue
+		}
+		_, _ = conn.WriteToUDP(out, recv.UDPAddr)
 	}
 }

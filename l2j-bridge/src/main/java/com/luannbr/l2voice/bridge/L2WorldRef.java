@@ -23,6 +23,13 @@ final class L2WorldRef {
     private final Method getConnection;      // L2GameClient.getConnection()
     private final Method getSocketChannel;   // MMOConnection.getSocketChannel()
     private final Method getName;            // L2PcInstance.getName()
+    // Group voice (party/clan/ally) — resolved lazily, may be null if
+    // the L2J build doesn't expose them via these exact names.
+    private final Method getParty;           // L2PcInstance.getParty() -> L2Party
+    private final Method getPartyMembers;    // L2Party.getPartyMembers() -> List<L2PcInstance>
+    private final Method getClan;            // L2PcInstance.getClan() -> L2Clan
+    private final Method getOnlineMembersList; // L2Clan.getOnlineMembersList()
+    private final Method getAllyId;          // L2Clan.getAllyId() -> int
 
     L2WorldRef() throws Exception {
         Class<?> world = Class.forName("net.l2emuproject.gameserver.model.L2World");
@@ -37,6 +44,16 @@ final class L2WorldRef {
         getInstanceId = pc.getMethod("getInstanceId");
         getClient     = pc.getMethod("getClient");
         getName       = pc.getMethod("getName");
+
+        // Optional methods — resolved with reflection-tolerant
+        // lookup so a missing one doesn't abort init.
+        getParty               = tryGetMethod(pc, "getParty");
+        getClan                = tryGetMethod(pc, "getClan");
+        Class<?> party = tryClass("net.l2emuproject.gameserver.model.L2Party");
+        getPartyMembers        = party == null ? null : tryGetMethod(party, "getPartyMembers");
+        Class<?> clan  = tryClass("net.l2emuproject.gameserver.model.L2Clan");
+        getOnlineMembersList   = clan == null ? null : tryGetMethod(clan, "getOnlineMembersList");
+        getAllyId              = clan == null ? null : tryGetMethod(clan, "getAllyId");
 
         Class<?> gameClient = Class.forName(
                 "net.l2emuproject.gameserver.network.L2GameClient");
@@ -110,6 +127,94 @@ final class L2WorldRef {
     private static boolean isLoopback(String s) {
         return s.equals("127.0.0.1") || s.equals("0:0:0:0:0:0:0:1")
                 || s.equals("::1") || s.equalsIgnoreCase("localhost");
+    }
+
+    private static Method tryGetMethod(Class<?> c, String name) {
+        try { return c.getMethod(name); }
+        catch (Throwable t) { return null; }
+    }
+    private static Class<?> tryClass(String fqn) {
+        try { return Class.forName(fqn); }
+        catch (Throwable t) { return null; }
+    }
+
+    /**
+     * Returns the list of object-ids that belong to the same voice
+     * group as {@code objId} for the given channel.
+     *   channel=1 → party    (L2PcInstance.getParty().getPartyMembers())
+     *   channel=2 → clan     (L2PcInstance.getClan().getOnlineMembersList())
+     *   channel=3 → ally     (all online players in any clan sharing
+     *                         this player's clan's allyId)
+     * The returned list INCLUDES the asking player. Caller may want
+     * to filter the speaker out.
+     */
+    int[] getGroupMembers(int objId, int channel) throws Exception {
+        Object res = getAllPlayers.invoke(null);
+        Iterable<?> iter;
+        if (res instanceof Iterable<?> it)     iter = it;
+        else if (res instanceof Object[] arr)  iter = java.util.Arrays.asList(arr);
+        else if (res instanceof java.util.Map<?, ?> m) iter = m.values();
+        else                                   return new int[0];
+
+        // Find the asking player first.
+        Object asking = null;
+        for (Object p : iter) {
+            if (p != null && (int) getObjectId.invoke(p) == objId) {
+                asking = p; break;
+            }
+        }
+        if (asking == null) return new int[0];
+
+        switch (channel) {
+            case 1: { // party
+                if (getParty == null || getPartyMembers == null) return new int[0];
+                Object party = getParty.invoke(asking);
+                if (party == null) return new int[0];
+                Object list = getPartyMembers.invoke(party);
+                return toIdArray(list);
+            }
+            case 2: { // clan
+                if (getClan == null || getOnlineMembersList == null) return new int[0];
+                Object clan = getClan.invoke(asking);
+                if (clan == null) return new int[0];
+                Object list = getOnlineMembersList.invoke(clan);
+                return toIdArray(list);
+            }
+            case 3: { // ally
+                if (getClan == null || getAllyId == null) return new int[0];
+                Object clan = getClan.invoke(asking);
+                if (clan == null) return new int[0];
+                int allyId = (int) getAllyId.invoke(clan);
+                if (allyId == 0) return new int[0];
+                // Walk all online players, filter by their clan's allyId.
+                java.util.List<Integer> out = new java.util.ArrayList<>();
+                for (Object p : iter) {
+                    if (p == null) continue;
+                    Object pc = getClan.invoke(p);
+                    if (pc == null) continue;
+                    int aid = (int) getAllyId.invoke(pc);
+                    if (aid == allyId) out.add((int) getObjectId.invoke(p));
+                }
+                int[] arr = new int[out.size()];
+                for (int i = 0; i < arr.length; i++) arr[i] = out.get(i);
+                return arr;
+            }
+            default: return new int[0];
+        }
+    }
+
+    private int[] toIdArray(Object collection) throws Exception {
+        java.util.List<Integer> out = new java.util.ArrayList<>();
+        Iterable<?> iter;
+        if (collection instanceof Iterable<?> it) iter = it;
+        else if (collection instanceof Object[] arr) iter = java.util.Arrays.asList(arr);
+        else return new int[0];
+        for (Object p : iter) {
+            if (p != null) out.add((int) getObjectId.invoke(p));
+        }
+        int[] arr = new int[out.size()];
+        for (int i = 0; i < arr.length; i++) arr[i] = out.get(i);
+        return arr;
     }
 
     /** Returns the character name for an online player, or null. */

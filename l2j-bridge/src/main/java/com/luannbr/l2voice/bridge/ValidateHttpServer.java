@@ -57,6 +57,7 @@ final class ValidateHttpServer {
             server.createContext("/voice/check",    this::handleCheck);
             server.createContext("/voice/whoami",   this::handleWhoami);
             server.createContext("/voice/name",     this::handleName);
+            server.createContext("/voice/group",    this::handleGroup);
             server.setExecutor(null);     // single thread; load is trivial
             server.start();
             log.info("validate HTTP server listening on " + bind + ":" + port);
@@ -184,6 +185,36 @@ final class ValidateHttpServer {
         String quoted = name == null ? "null"
             : "\"" + name.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
         respond(ex, 200, "{\"player_id\":" + pid + ",\"name\":" + quoted + "}");
+    }
+
+    /** GET /voice/group?player_id=N&channel=N → {"members":[id, id, ...]} */
+    private void handleGroup(HttpExchange ex) throws IOException {
+        if (!"GET".equalsIgnoreCase(ex.getRequestMethod())) {
+            respond(ex, 405, "{\"members\":[]}");
+            return;
+        }
+        String q = ex.getRequestURI().getRawQuery();
+        int pid = parseQueryInt(q, "player_id");
+        int ch  = parseQueryInt(q, "channel");
+        if (pid == 0 || ch < 1 || ch > 3) {
+            respond(ex, 400, "{\"members\":[]}");
+            return;
+        }
+        int[] members = new int[0];
+        if (worldRef != null) {
+            try { members = worldRef.getGroupMembers(pid, ch); }
+            catch (Throwable t) {
+                log.log(Level.WARNING, "getGroupMembers failed", t);
+            }
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append("{\"members\":[");
+        for (int i = 0; i < members.length; i++) {
+            if (i > 0) sb.append(',');
+            sb.append(members[i]);
+        }
+        sb.append("]}");
+        respond(ex, 200, sb.toString());
     }
 
     private static String parseQueryStr(String q, String key) {

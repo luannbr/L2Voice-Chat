@@ -15,6 +15,7 @@
 
 #include "overlay.h"
 #include "audio_io.h"
+#include "resources.h"
 #include "voice.h"
 
 #include <windows.h>
@@ -215,35 +216,19 @@ void Logf(const char* fmt, ...) {
     OutputDebugStringA(buf);
 }
 
-// Loads voice-recorder.png from the directory the DLL itself was
-// loaded from, decodes it via stb_image, OPTIONALLY pre-tints all
-// non-transparent pixels to a solid color (the source PNG is black
-// with alpha — multiplying black × any tint at draw time stays
-// black, so we replace RGB here and keep the alpha as a mask), then
-// uploads to a managed D3D9 texture. Returns the texture pointer
-// (and out w/h) on success; nullptr on any failure.
+// Decodes PNG bytes (in memory) via stb_image, OPTIONALLY pre-tints
+// all non-transparent pixels to a solid color, then uploads to a
+// managed D3D9 texture. Returns the texture pointer (and out w/h)
+// on success; nullptr on any failure.
 //
 // tintRgb: 0xRRGGBB to recolor opaque pixels; pass 0 to leave the
 // original colors alone.
-IDirect3DTexture9* LoadPngAsTexture(IDirect3DDevice9* dev,
-        const wchar_t* path, int& w, int& h, uint32_t tintRgb = 0) {
-    // Read the file ourselves so stb_image (which is ASCII-path only)
-    // doesn't choke on Unicode paths.
-    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
-        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (f == INVALID_HANDLE_VALUE) return nullptr;
-    LARGE_INTEGER sz; GetFileSizeEx(f, &sz);
-    if (sz.QuadPart <= 0 || sz.QuadPart > 8 * 1024 * 1024) {
-        CloseHandle(f); return nullptr;
-    }
-    std::vector<unsigned char> buf((size_t)sz.QuadPart);
-    DWORD read = 0;
-    BOOL ok = ReadFile(f, buf.data(), (DWORD)buf.size(), &read, nullptr);
-    CloseHandle(f);
-    if (!ok || read != buf.size()) return nullptr;
-
+IDirect3DTexture9* LoadPngBufferAsTexture(IDirect3DDevice9* dev,
+        const void* buffer, size_t bufferSize,
+        int& w, int& h, uint32_t tintRgb = 0) {
     int c = 0;
-    unsigned char* px = stbi_load_from_memory(buf.data(), (int)buf.size(),
+    unsigned char* px = stbi_load_from_memory(
+        static_cast<const unsigned char*>(buffer), (int)bufferSize,
         &w, &h, &c, 4);
     if (!px) return nullptr;
 
@@ -286,19 +271,25 @@ IDirect3DTexture9* LoadPngAsTexture(IDirect3DDevice9* dev,
     return tex;
 }
 
-// Builds the absolute path to a file in the same directory as this
-// DLL (resolved via GetModuleHandleEx on a function in our module).
-void ResolveDllRelativePath(const wchar_t* name,
-        wchar_t* out, size_t cap) {
+// Loads the PNG embedded as RCDATA resource IDR_MIC_PNG (baked into
+// l2voice.dll at compile time by voice/resources.rc.in). No external
+// file dependency.
+IDirect3DTexture9* LoadEmbeddedMicTexture(IDirect3DDevice9* dev,
+        int& w, int& h, uint32_t tintRgb) {
     HMODULE self = nullptr;
     GetModuleHandleExW(
         GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
         GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        reinterpret_cast<LPCWSTR>(&LoadPngAsTexture), &self);
-    GetModuleFileNameW(self, out, (DWORD)cap);
-    wchar_t* slash = wcsrchr(out, L'\\');
-    if (slash) *(slash + 1) = 0;
-    wcsncat_s(out, cap, name, _TRUNCATE);
+        reinterpret_cast<LPCWSTR>(&LoadPngBufferAsTexture), &self);
+    HRSRC hRes = FindResourceW(self, MAKEINTRESOURCEW(IDR_MIC_PNG),
+        reinterpret_cast<LPCWSTR>(RT_RCDATA));
+    if (!hRes) return nullptr;
+    HGLOBAL hData = LoadResource(self, hRes);
+    if (!hData) return nullptr;
+    void* bytes = LockResource(hData);
+    DWORD size = SizeofResource(self, hRes);
+    if (!bytes || size == 0) return nullptr;
+    return LoadPngBufferAsTexture(dev, bytes, size, w, h, tintRgb);
 }
 
 void VkToString(int vk, char* out, size_t cap) {
@@ -627,33 +618,59 @@ void DrawPanel() {
 
     OverlayState st = SnapshotOverlayState();
 
-    // Fixed-size window so the user can't accidentally resize it.
-    // Title bar enabled (= draggable, shows connection status), no
-    // collapse triangle, no resize grip. A custom menu bar below the
-    // title hosts the minimize "_" button.
-    ImGui::SetNextWindowSize(ImVec2(320, 410), ImGuiCond_Always);
+    // Fixed-size window. Title bar enabled (= draggable, shows
+    // connection status), no collapse triangle, no resize grip. The
+    // minimize "_" button is rendered manually as an overlay on the
+    // title-bar pixels (see below).
+    ImGui::SetNextWindowSize(ImVec2(320, 400), ImGuiCond_Always);
     char titleBuf[64];
     _snprintf_s(titleBuf, sizeof(titleBuf), _TRUNCATE,
         "l2voice  %s###l2voice_window",
         st.ws_connected ? "[connected]" : "[offline]");
     ImGuiWindowFlags wflags = ImGuiWindowFlags_NoCollapse
-                            | ImGuiWindowFlags_NoResize
-                            | ImGuiWindowFlags_MenuBar;
+                            | ImGuiWindowFlags_NoResize;
     if (!ImGui::Begin(titleBuf, nullptr, wflags)) {
         ImGui::End();
         return;
     }
 
-    // Menu bar = the row immediately under the title bar. Right-aligned
-    // minimize button so it visually anchors to the title corner.
-    if (ImGui::BeginMenuBar()) {
-        float btnW = ImGui::CalcTextSize(" _ ").x + 16.0f;
-        float avail = ImGui::GetContentRegionAvail().x;
-        if (avail > btnW) ImGui::Dummy(ImVec2(avail - btnW, 0));
-        if (ImGui::SmallButton(" _ ##min")) {
-            g_minimized.store(true);
-        }
-        ImGui::EndMenuBar();
+    // ---- Minimize button drawn DIRECTLY on the title bar ----
+    // ImGui doesn't expose a "custom title-bar button" API, but we
+    // can render over the title bar's pixels via the window's draw
+    // list (which is the same layer the title was drawn into) and
+    // hit-test the rectangle manually. The button sits in the
+    // right corner of the title bar, where the close 'x' lives in
+    // other apps.
+    {
+        ImGuiStyle& s = ImGui::GetStyle();
+        const float titleH = ImGui::GetFontSize() + s.FramePadding.y * 2;
+        ImVec2 winP   = ImGui::GetWindowPos();
+        float  winW   = ImGui::GetWindowWidth();
+        const float btnSz = titleH - 4;
+        ImVec2 btnMin(winP.x + winW - btnSz - 4, winP.y + 2);
+        ImVec2 btnMax(btnMin.x + btnSz, btnMin.y + btnSz);
+        bool hovered = ImGui::IsMouseHoveringRect(btnMin, btnMax);
+        bool clicked = hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+        if (clicked) g_minimized.store(true);
+
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ImU32 bg = hovered
+            ? IM_COL32(0xd4, 0xaf, 0x37, 0x55)
+            : IM_COL32(0, 0, 0, 0);
+        if (bg) dl->AddRectFilled(btnMin, btnMax, bg, 2.0f);
+        ImU32 fg = hovered
+            ? IM_COL32(0xff, 0xd6, 0x60, 0xff)
+            : IM_COL32(0xd4, 0xaf, 0x37, 0xff);
+        // Centered "_" — manually drawn line for crisp positioning
+        // (text "_" floats too low at the title-bar baseline).
+        float midY = (btnMin.y + btnMax.y) * 0.5f + btnSz * 0.25f;
+        dl->AddLine(ImVec2(btnMin.x + 4, midY),
+                    ImVec2(btnMax.x - 4, midY), fg, 2.0f);
+
+        // If the user clicked our button area, ImGui still thinks
+        // the title bar handled the click for dragging. That's OK —
+        // setting g_minimized swaps to icon mode on next frame
+        // regardless of any drag attempt.
     }
 
     // ====== Session + player name ======
@@ -802,22 +819,17 @@ HRESULT WINAPI HookEndScene(IDirect3DDevice9* dev) {
             SetWindowLongPtrW(hwnd, GWLP_WNDPROC,
                               reinterpret_cast<LONG_PTR>(&HookedWndProc)));
 
-        // Load the microphone icon for the minimized state. Lives next
-        // to l2voice.dll. Pre-tinted to bright gold (#d4af37) at load
-        // because the source PNG is solid black + alpha — sampling it
-        // with an ImGui tint would still produce black (0×gold=0).
-        wchar_t iconPath[MAX_PATH];
-        ResolveDllRelativePath(L"voice-recorder.png", iconPath, MAX_PATH);
-        // Pre-tint to WHITE — runtime tint then colors it (gold base,
-        // brighter gold on hover). White × tint = tint, so the
-        // runtime tint is the displayed color.
-        g_micTexture = LoadPngAsTexture(dev, iconPath,
-            g_micW, g_micH, /*tintRgb*/ 0xFFFFFF);
+        // Mic icon — embedded as RCDATA in the DLL (see
+        // voice/resources.rc.in). Pre-tinted to WHITE so the runtime
+        // tint controls the displayed color (gold base, brighter on
+        // hover). No file dependency at runtime.
+        g_micTexture = LoadEmbeddedMicTexture(dev, g_micW, g_micH,
+            /*tintRgb*/ 0xFFFFFF);
         if (g_micTexture) {
-            Logf("[l2voice] icon loaded: %dx%d\n", g_micW, g_micH);
+            Logf("[l2voice] icon loaded from resource: %dx%d\n",
+                g_micW, g_micH);
         } else {
-            Logf("[l2voice] icon NOT loaded (path=%ws) — fallback to text\n",
-                iconPath);
+            Logf("[l2voice] embedded icon resource not found — text fallback\n");
         }
 
         g_imguiBackendInit.store(true);

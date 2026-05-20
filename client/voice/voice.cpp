@@ -81,23 +81,30 @@ void OnCaptureFrame(const int16_t* pcm, uint32_t samples) {
     if (samples != kFrameSamples) return;
 
     bool focused = !g_mod.cfg.require_focus || L2HasForegroundFocus();
-    bool ptt_pressed = false;
-    if (g_mod.cfg.ptt_proximity != 0) {
-        ptt_pressed = (GetAsyncKeyState(g_mod.cfg.ptt_proximity) & 0x8000) != 0;
-    }
-    // Transmit decision:
-    //   always_on  → talk whenever the L2 window is focused
-    //   PTT mode   → talk only when the L2 window is focused AND PTT is held
-    // require_focus=0 disables the focus check (useful for testing only).
-    bool transmit = focused && (g_mod.cfg.always_on || ptt_pressed);
+
+    // Channel priority on multi-PTT-held: ally > clan > party > proximity.
+    // always_on only routes to proximity (group channels still require
+    // an explicit PTT — accidentally broadcasting on clan/ally without
+    // intent would be terrible).
+    auto held = [](int vk) -> bool {
+        return vk != 0 && (GetAsyncKeyState(vk) & 0x8000) != 0;
+    };
+    uint8_t channel = 0xFF;   // none
+    if      (held(g_mod.cfg.ptt_ally))      channel = 3;
+    else if (held(g_mod.cfg.ptt_clan))      channel = 2;
+    else if (held(g_mod.cfg.ptt_party))     channel = 1;
+    else if (held(g_mod.cfg.ptt_proximity)
+          || g_mod.cfg.always_on)           channel = 0;
+    bool transmit = focused && channel != 0xFF;
 
     static uint32_t cap_frames = 0;
     if ((++cap_frames % 50) == 0) {
-        char dbg[200];
+        char dbg[220];
         _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-            "[l2voice] capture=%u tx=%d focus=%d ptt=%d on=%d ws=%d sid=%u\n",
-            cap_frames, transmit ? 1 : 0, focused ? 1 : 0,
-            ptt_pressed ? 1 : 0, g_mod.cfg.always_on ? 1 : 0,
+            "[l2voice] capture=%u tx=%d ch=%u focus=%d on=%d ws=%d sid=%u\n",
+            cap_frames, transmit ? 1 : 0,
+            channel == 0xFF ? 0xFF : channel,
+            focused ? 1 : 0, g_mod.cfg.always_on ? 1 : 0,
             g_mod.net.IsConnected() ? 1 : 0, g_mod.net.SessionID());
         OutputDebugStringA(dbg);
     }
@@ -109,15 +116,9 @@ void OnCaptureFrame(const int16_t* pcm, uint32_t samples) {
     int n = g_mod.encoder.Encode(pcm, opus_buf, sizeof(opus_buf));
     if (n <= 0) return;
 
-    static uint32_t sent = 0;
-    if ((++sent % 50) == 1) {  // every ~1s of speech
-        char dbg[96];
-        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-            "[l2voice] SendProximityFrame #%u (%d bytes opus)\n", sent, n);
-        OutputDebugStringA(dbg);
-    }
     uint16_t seq = g_mod.tx_seq.fetch_add(1, std::memory_order_relaxed);
-    g_mod.net.SendProximityFrame(seq, opus_buf, n);
+    if (channel == 0) g_mod.net.SendProximityFrame(seq, opus_buf, n);
+    else              g_mod.net.SendGroupFrame(channel, seq, opus_buf, n);
 }
 
 void OnIncomingPacket(uint8_t channel, uint32_t src, uint16_t /*seq*/,
