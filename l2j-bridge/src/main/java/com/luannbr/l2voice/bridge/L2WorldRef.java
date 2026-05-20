@@ -31,6 +31,11 @@ final class L2WorldRef {
     private final Method getOnlineMembersList; // L2Clan.getOnlineMembersList()
     private final Method getAllyId;          // L2Clan.getAllyId() -> int
 
+    // Extra L2J accessors used by the clan-voice expansion.
+    // Resolved best-effort — missing ones leave the corresponding
+    // feature off rather than aborting init.
+    private Method getLeaderId;       // L2Clan.getLeaderId()
+
     L2WorldRef() throws Exception {
         Class<?> world = Class.forName("net.l2emuproject.gameserver.model.L2World");
         getAllPlayers = world.getMethod("getAllPlayers");
@@ -54,6 +59,7 @@ final class L2WorldRef {
         Class<?> clan  = tryClass("net.l2emuproject.gameserver.model.L2Clan");
         getOnlineMembersList   = clan == null ? null : tryGetMethod(clan, "getOnlineMembersList");
         getAllyId              = clan == null ? null : tryGetMethod(clan, "getAllyId");
+        getLeaderId            = clan == null ? null : tryGetMethod(clan, "getLeaderId");
 
         Class<?> gameClient = Class.forName(
                 "net.l2emuproject.gameserver.network.L2GameClient");
@@ -66,6 +72,27 @@ final class L2WorldRef {
     @FunctionalInterface
     interface Sink {
         void accept(int oid, int x, int y, int z, int instanceId);
+    }
+
+    @FunctionalInterface
+    interface SnapshotSink {
+        void accept(PlayerSnapshot s);
+    }
+
+    /** Iterates all online players and feeds a full snapshot to the
+     *  sink. Used by PositionPoller to diff per-player state and emit
+     *  change events (clan / ally / party / position). */
+    void forEachSnapshot(SnapshotSink sink) throws Exception {
+        Object res = getAllPlayers.invoke(null);
+        Iterable<?> iter;
+        if (res instanceof Iterable<?> it)     iter = it;
+        else if (res instanceof Object[] arr)  iter = java.util.Arrays.asList(arr);
+        else if (res instanceof java.util.Map<?, ?> m) iter = m.values();
+        else                                   return;
+        for (Object p : iter) {
+            if (p == null) continue;
+            try { sink.accept(snapshot(p)); } catch (Throwable ignored) {}
+        }
     }
 
     void forEachPlayer(Sink sink) throws Exception {
@@ -127,6 +154,57 @@ final class L2WorldRef {
     private static boolean isLoopback(String s) {
         return s.equals("127.0.0.1") || s.equals("0:0:0:0:0:0:0:1")
                 || s.equals("::1") || s.equalsIgnoreCase("localhost");
+    }
+
+    /** Snapshot of the L2J state for a single player. Cheap value
+     *  object — PositionPoller builds one per online player per tick
+     *  and diffs against the previous to emit change events. */
+    static final class PlayerSnapshot {
+        int objectId;
+        int x, y, z, instanceId;
+        int clanId;          // 0 = no clan
+        int allyId;          // 0 = no alliance
+        int partyId;         // 0 = no party; otherwise identityHashCode(L2Party)
+        boolean isClanLeader;
+    }
+
+    /** Reads everything Phase-A cares about from one L2PcInstance. */
+    PlayerSnapshot snapshot(Object pc) throws Exception {
+        PlayerSnapshot s = new PlayerSnapshot();
+        s.objectId   = (int) getObjectId.invoke(pc);
+        s.x          = (int) getX.invoke(pc);
+        s.y          = (int) getY.invoke(pc);
+        s.z          = (int) getZ.invoke(pc);
+        s.instanceId = (int) getInstanceId.invoke(pc);
+        Object clan = (getClan != null) ? getClan.invoke(pc) : null;
+        if (clan != null) {
+            // L2Clan.getId — fall through to any int-returning method
+            // named getClanId / getId; common in L2J forks.
+            int cid = invokeIntOrZero(clan, "getId");
+            if (cid == 0) cid = invokeIntOrZero(clan, "getClanId");
+            s.clanId = cid;
+            s.allyId = getAllyId != null ? (int) getAllyId.invoke(clan) : 0;
+            if (getLeaderId != null) {
+                s.isClanLeader = ((int) getLeaderId.invoke(clan)) == s.objectId;
+            }
+        }
+        Object party = (getParty != null) ? getParty.invoke(pc) : null;
+        if (party != null) {
+            // No stable id in L2Party — use object identity. Stable
+            // within a single bridge JVM lifetime; resets on restart
+            // (voice-service caches will recover within ~5 s polls).
+            s.partyId = System.identityHashCode(party);
+        }
+        return s;
+    }
+
+    private static int invokeIntOrZero(Object target, String methodName) {
+        try {
+            Method m = target.getClass().getMethod(methodName);
+            return (int) m.invoke(target);
+        } catch (Throwable t) {
+            return 0;
+        }
     }
 
     private static Method tryGetMethod(Class<?> c, String name) {

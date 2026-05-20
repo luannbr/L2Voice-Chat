@@ -86,6 +86,34 @@ final class RedisPublisher {
                 "\"instance_id\":" + instanceId));
     }
 
+    /** Clan id changed (joined a clan, left, switched). 0 = no clan. */
+    void publishClanChange(int playerId, int clanId, boolean isLeader) {
+        offer(envelope(playerId, "clan_change",
+                "\"clan_id\":" + clanId +
+                ",\"is_leader\":" + isLeader));
+    }
+
+    /** Ally id changed. 0 = no alliance. */
+    void publishAllyChange(int playerId, int allyId) {
+        offer(envelope(playerId, "ally_change",
+                "\"ally_id\":" + allyId));
+    }
+
+    /** Party identity changed. partyId = 0 means the player left their
+     *  party; otherwise an opaque stable id for the duration of the
+     *  party (within this bridge process). */
+    void publishPartyChange(int playerId, int partyId) {
+        offer(envelope(playerId, "party_change",
+                "\"party_id\":" + partyId));
+    }
+
+    /** A clan's leader changed — emitted with the new leader's id. */
+    void publishClanLeaderChange(int clanId, int newLeaderId) {
+        offer(envelope(newLeaderId, "clan_leader_change",
+                "\"clan_id\":" + clanId +
+                ",\"leader_id\":" + newLeaderId));
+    }
+
     // ---- internals -----------------------------------------------------
 
     private static String envelope(int playerId, String event, String dataBody) {

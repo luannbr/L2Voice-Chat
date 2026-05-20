@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/luannbr/l2voice/voice-service/internal/topology"
+	"github.com/luannbr/l2voice/voice-service/internal/world"
 )
 
 // Config bundles the Redis connection settings.
@@ -48,9 +49,33 @@ type positionPayload struct {
 	InstanceID uint32  `json:"instance_id"`
 }
 
+type clanChangePayload struct {
+	ClanID   uint32 `json:"clan_id"`
+	IsLeader bool   `json:"is_leader"`
+}
+
+type allyChangePayload struct {
+	AllyID uint32 `json:"ally_id"`
+}
+
+type partyChangePayload struct {
+	PartyID uint64 `json:"party_id"`
+}
+
+type clanLeaderChangePayload struct {
+	ClanID   uint32 `json:"clan_id"`
+	LeaderID uint32 `json:"leader_id"`
+}
+
 // Subscribe runs the Redis SUBSCRIBE loop. Reconnects with backoff on
 // drop. Returns only when ctx is cancelled.
-func Subscribe(ctx context.Context, cfg Config, state *topology.State) error {
+//
+// state (topology) carries network-session-level data (UDP addr,
+// last-seen). worldState carries game-level data (clan/ally/party,
+// positions, sub-leaders, etc.). Both are updated as relevant events
+// arrive.
+func Subscribe(ctx context.Context, cfg Config, state *topology.State,
+	worldState *world.WorldState) error {
 	if cfg.Channel == "" {
 		cfg.Channel = "l2voice:events"
 	}
@@ -59,7 +84,7 @@ func Subscribe(ctx context.Context, cfg Config, state *topology.State) error {
 		if err := ctx.Err(); err != nil {
 			return nil
 		}
-		if err := runOnce(ctx, cfg, state); err != nil {
+		if err := runOnce(ctx, cfg, state, worldState); err != nil {
 			log.Printf("social: redis subscribe error: %v (retry in %v)", err, backoff)
 			select {
 			case <-time.After(backoff):
@@ -75,7 +100,8 @@ func Subscribe(ctx context.Context, cfg Config, state *topology.State) error {
 	}
 }
 
-func runOnce(ctx context.Context, cfg Config, state *topology.State) error {
+func runOnce(ctx context.Context, cfg Config, state *topology.State,
+	worldState *world.WorldState) error {
 	d := net.Dialer{Timeout: 5 * time.Second}
 	conn, err := d.DialContext(ctx, "tcp", cfg.Addr)
 	if err != nil {
@@ -117,45 +143,115 @@ func runOnce(ctx context.Context, cfg Config, state *topology.State) error {
 			// confirmation; ignore
 		case "message":
 			body, _ := arr[2].(string)
-			handleEvent([]byte(body), state)
+			handleEvent([]byte(body), state, worldState)
 		case "pmessage":
 			if len(arr) >= 4 {
 				body, _ := arr[3].(string)
-				handleEvent([]byte(body), state)
+				handleEvent([]byte(body), state, worldState)
 			}
 		}
 	}
 }
 
-func handleEvent(raw []byte, state *topology.State) {
+func handleEvent(raw []byte, state *topology.State, w *world.WorldState) {
 	var ev Event
 	if err := json.Unmarshal(raw, &ev); err != nil {
 		log.Printf("social: malformed event: %v", err)
 		return
 	}
+	// World state tracks ALL online players (independent of voice
+	// session), so we always update it. Voice-session updates only
+	// happen when a session has been allocated.
 	sess := state.LookupByPlayer(ev.PlayerID)
-	if sess == nil {
-		// Player not currently in a voice session — nothing to update.
-		return
-	}
+
 	switch ev.Event {
 	case "position", "player_login":
 		var p positionPayload
 		if err := json.Unmarshal(ev.Data, &p); err != nil {
 			return
 		}
-		state.UpdatePosition(sess, p.X, p.Y, p.Z, p.InstanceID)
+		w.SetPlayerPosition(ev.PlayerID, p.X, p.Y, p.Z, p.InstanceID)
+		if sess != nil {
+			state.UpdatePosition(sess, p.X, p.Y, p.Z, p.InstanceID)
+		}
+
 	case "instance_change":
 		var p positionPayload
 		if err := json.Unmarshal(ev.Data, &p); err != nil {
 			return
 		}
-		// Only InstanceID is authoritative here; keep last-known X/Y/Z.
-		state.UpdatePosition(sess, sess.X, sess.Y, sess.Z, p.InstanceID)
+		if sess != nil {
+			state.UpdatePosition(sess, sess.X, sess.Y, sess.Z, p.InstanceID)
+		}
+		// World: keep last-known X/Y/Z, replace instance.
+		if pl := w.Player(ev.PlayerID); pl != nil {
+			w.SetPlayerPosition(ev.PlayerID, pl.X, pl.Y, pl.Z, p.InstanceID)
+		}
+
+	case "clan_change":
+		var p clanChangePayload
+		if err := json.Unmarshal(ev.Data, &p); err != nil {
+			return
+		}
+		// Ensure the Player record exists; upsert without disturbing
+		// fields we don't know (use zeros for ally/party; subsequent
+		// ally/party events will fill them in).
+		existing := w.Player(ev.PlayerID)
+		var allyID uint32
+		var partyID uint64
+		var instanceID uint32
+		if existing != nil {
+			allyID = existing.AllyID
+			partyID = existing.PartyID
+			instanceID = existing.InstanceID
+		}
+		w.UpsertPlayer(ev.PlayerID, p.ClanID, allyID, partyID, instanceID, p.IsLeader)
+
+	case "ally_change":
+		var p allyChangePayload
+		if err := json.Unmarshal(ev.Data, &p); err != nil {
+			return
+		}
+		existing := w.Player(ev.PlayerID)
+		var clanID, instanceID uint32
+		var partyID uint64
+		var isLeader bool
+		if existing != nil {
+			clanID = existing.ClanID
+			partyID = existing.PartyID
+			instanceID = existing.InstanceID
+			isLeader = existing.IsLeader
+		}
+		w.UpsertPlayer(ev.PlayerID, clanID, p.AllyID, partyID, instanceID, isLeader)
+
+	case "party_change":
+		var p partyChangePayload
+		if err := json.Unmarshal(ev.Data, &p); err != nil {
+			return
+		}
+		existing := w.Player(ev.PlayerID)
+		var clanID, allyID, instanceID uint32
+		var isLeader bool
+		if existing != nil {
+			clanID = existing.ClanID
+			allyID = existing.AllyID
+			instanceID = existing.InstanceID
+			isLeader = existing.IsLeader
+		}
+		w.UpsertPlayer(ev.PlayerID, clanID, allyID, p.PartyID, instanceID, isLeader)
+
+	case "clan_leader_change":
+		var p clanLeaderChangePayload
+		if err := json.Unmarshal(ev.Data, &p); err != nil {
+			return
+		}
+		w.UpsertClan(p.ClanID, p.LeaderID, false)
+
 	case "player_logout":
-		state.Drop(sess.ID)
-	default:
-		// Other events (party/clan/ally) handled by future code.
+		if sess != nil {
+			state.Drop(sess.ID)
+		}
+		w.RemovePlayer(ev.PlayerID)
 	}
 }
 

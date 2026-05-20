@@ -25,6 +25,7 @@ import (
 	"github.com/luannbr/l2voice/voice-service/internal/control"
 	"github.com/luannbr/l2voice/voice-service/internal/social"
 	"github.com/luannbr/l2voice/voice-service/internal/topology"
+	"github.com/luannbr/l2voice/voice-service/internal/world"
 )
 
 func main() {
@@ -41,8 +42,13 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	log.Printf("l2voice voice-service starting (udp=%s ws=%s)", *udpAddr, *wsAddr)
 
-	// Shared state across UDP and WS handlers.
+	// Network-session state (per voice WS) and game-world state
+	// (per L2 character). The router will read mostly from world;
+	// topology stays for session lifecycle (UDP addr, sid alloc).
 	state := topology.NewState()
+	worldState := world.NewWorldState()
+	_ = worldState   // wired into social subscriber below; future
+	                 // phases wire it into audio router + WS control.
 
 	// Wire the L2J /voice/whoami endpoint. Required — voice-service can't
 	// resolve a WS connection's player_id without it.
@@ -76,7 +82,7 @@ func main() {
 		go func() {
 			if err := social.Subscribe(ctx,
 				social.Config{Addr: *redisAddr, Channel: *redisChan},
-				state); err != nil {
+				state, worldState); err != nil {
 				log.Printf("social.Subscribe exited: %v", err)
 			}
 		}()

@@ -7,14 +7,23 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * Periodically reads positions of online players from L2World and
- * publishes {@code "position"} events. Throttles per player by a
- * minimum delta to avoid flooding the bus when nothing is moving.
+ * Periodically iterates online players and publishes voice-relevant
+ * state changes to Redis:
+ *   - position (throttled by minDelta cm + heartbeat every 3 s)
+ *   - clan_change   (when clanId / isClanLeader changes)
+ *   - ally_change   (when allyId changes)
+ *   - party_change  (when partyId changes)
+ *   - clan_leader_change (when a player became their clan's leader)
  *
- * <p>We use reflection to avoid a hard compile-time dependency on the
- * L2J class names — the bridge can outlive minor refactors of
- * {@code L2World}/{@code L2PcInstance} that way. The class/method
- * names are L2J Essence 542 specifics; tweak them here if you fork.
+ * <p>State diffing is done against an in-memory {@code Map<Integer,
+ * PlayerSnapshot>}. First-sight of a player publishes ALL fields
+ * (we treat the previous snapshot as zero), so the voice-service
+ * picks up the initial clan/ally/party state without waiting for a
+ * change.
+ *
+ * <p>L2J class names are accessed via reflection in {@link
+ * L2WorldRef}; this poller stays decoupled from compile-time L2J
+ * types.
  */
 final class PositionPoller {
 
@@ -27,13 +36,13 @@ final class PositionPoller {
     private final AtomicBoolean stopping = new AtomicBoolean(false);
     private Thread thread;
 
-    /** Last-published snapshot per player to gate by delta. */
-    private final Map<Integer, int[]> last = new HashMap<>();
-    /** Last-publish wall-clock-ms per player. Heartbeat publishes even
-     *  when the player isn't moving, so the voice-service eventually
-     *  learns their position even if it allocated the session AFTER
-     *  the first-sight publish. */
-    private final Map<Integer, Long> lastPublishMs = new HashMap<>();
+    /** Per-player last snapshot for delta detection. */
+    private final Map<Integer, L2WorldRef.PlayerSnapshot> last = new HashMap<>();
+
+    /** Last position-publish wall-clock-ms per player. Heartbeat
+     *  re-publishes position even when stationary so the voice-service
+     *  picks it up even if it allocated the session after first-sight. */
+    private final Map<Integer, Long> lastPosPublishMs = new HashMap<>();
     private static final long HEARTBEAT_MS = 3000;
 
     PositionPoller(RedisPublisher pub, int hz, int minDelta) {
@@ -68,24 +77,23 @@ final class PositionPoller {
         while (!stopping.get()) {
             long t0 = System.currentTimeMillis();
             try {
-                int[] cnt = {0, 0};   // seen, published
-                world.forEachPlayer((oid, x, y, z, inst) -> {
+                final int[] cnt = {0, 0};   // seen, events_published
+                world.forEachSnapshot(s -> {
                     cnt[0]++;
-                    int before = publishedThisTick;
-                    tickPlayer(oid, x, y, z, inst);
-                    if (publishedThisTick > before) cnt[1]++;
+                    publishedThisTick = 0;
+                    tickPlayer(s);
+                    cnt[1] += publishedThisTick;
                 });
                 publishedSinceStats += cnt[1];
-                // Stats log every ~30 s so we can see PositionPoller is alive.
                 if (t0 - lastStats > 30_000) {
                     log.info("PositionPoller: " + cnt[0] + " players visible, "
-                            + publishedSinceStats + " position events in last "
+                            + publishedSinceStats + " events in last "
                             + ((t0 - lastStats) / 1000) + "s");
                     lastStats = t0;
                     publishedSinceStats = 0;
                 }
             } catch (Exception e) {
-                log.log(Level.WARNING, "position poll iteration failed", e);
+                log.log(Level.WARNING, "poll iteration failed", e);
             }
             long sleep = periodMs - (System.currentTimeMillis() - t0);
             if (sleep > 0) {
@@ -97,27 +105,51 @@ final class PositionPoller {
 
     private int publishedThisTick = 0;
 
-    private void tickPlayer(int objectId, int x, int y, int z, int instanceId) {
-        int[] prev = last.get(objectId);
+    private void tickPlayer(L2WorldRef.PlayerSnapshot s) {
+        L2WorldRef.PlayerSnapshot prev = last.get(s.objectId);
         long now = System.currentTimeMillis();
-        Long lastMs = lastPublishMs.get(objectId);
+
+        // ---- clan / ally / party / leader diffs ----
+        // First-sight: publish current values. Subsequent ticks only
+        // publish on change.
+        if (prev == null || prev.clanId != s.clanId || prev.isClanLeader != s.isClanLeader) {
+            pub.publishClanChange(s.objectId, s.clanId, s.isClanLeader);
+            publishedThisTick++;
+            // If THIS player just became their clan's leader, also
+            // emit a clan_leader_change event so the voice-service
+            // updates its Clan.LeaderID atomically.
+            if (s.isClanLeader && s.clanId != 0
+                    && (prev == null || !prev.isClanLeader)) {
+                pub.publishClanLeaderChange(s.clanId, s.objectId);
+                publishedThisTick++;
+            }
+        }
+        if (prev == null || prev.allyId != s.allyId) {
+            pub.publishAllyChange(s.objectId, s.allyId);
+            publishedThisTick++;
+        }
+        if (prev == null || prev.partyId != s.partyId) {
+            pub.publishPartyChange(s.objectId, s.partyId);
+            publishedThisTick++;
+        }
+        if (prev == null || prev.instanceId != s.instanceId) {
+            pub.publishInstanceChange(s.objectId, s.instanceId);
+            publishedThisTick++;
+        }
+
+        // ---- position (movement-throttled + heartbeat) ----
+        Long lastMs = lastPosPublishMs.get(s.objectId);
         boolean heartbeatDue = lastMs == null || (now - lastMs) >= HEARTBEAT_MS;
         boolean movedEnough = prev == null
-                || Math.abs(prev[0] - x) >= minDelta
-                || Math.abs(prev[1] - y) >= minDelta
-                || Math.abs(prev[2] - z) >= minDelta
-                || prev[3] != instanceId;
-        if (!heartbeatDue && !movedEnough) {
-            return;
+                || Math.abs(prev.x - s.x) >= minDelta
+                || Math.abs(prev.y - s.y) >= minDelta
+                || Math.abs(prev.z - s.z) >= minDelta;
+        if (heartbeatDue || movedEnough) {
+            pub.publishPosition(s.objectId, s.x, s.y, s.z, s.instanceId);
+            lastPosPublishMs.put(s.objectId, now);
+            publishedThisTick++;
         }
-        if (prev == null) {
-            last.put(objectId, new int[]{x, y, z, instanceId});
-        } else {
-            prev[0] = x; prev[1] = y; prev[2] = z; prev[3] = instanceId;
-        }
-        lastPublishMs.put(objectId, now);
-        pub.publishPosition(objectId, x, y, z, instanceId);
-        publishedThisTick++;
-    }
 
+        last.put(s.objectId, s);
+    }
 }
