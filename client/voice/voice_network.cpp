@@ -76,6 +76,7 @@ struct VoiceNetwork::Impl {
     std::vector<uint16_t> client_ports;
 
     std::atomic<uint32_t> session_id{0};
+    std::atomic<uint32_t> player_id_resolved{0};
     std::string udp_host;
     std::atomic<uint16_t> udp_port{0};
     std::atomic<bool> connected{false};
@@ -238,13 +239,17 @@ struct VoiceNetwork::Impl {
             return;
         }
         session_id.store((uint32_t)sid_u);
+        uint64_t pid_u = 0;
+        if (ExtractNumber(s, "your_player_id", pid_u)) {
+            player_id_resolved.store((uint32_t)pid_u);
+        }
         udp_host = host;
         udp_port.store(port);
         SetUdpDest(host, port);
-        char dbg[160];
+        char dbg[200];
         _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-            "[l2voice] auth_ok session_id=%u udp_endpoint=%s:%u\n",
-            (uint32_t)sid_u, host.c_str(), port);
+            "[l2voice] auth_ok session_id=%u player_id=%u udp_endpoint=%s:%u\n",
+            (uint32_t)sid_u, (uint32_t)pid_u, host.c_str(), port);
         OutputDebugStringA(dbg);
         if (on_auth) on_auth((uint32_t)sid_u, host.c_str(), port);
     }
@@ -338,5 +343,6 @@ void VoiceNetwork::SendKeepalive() {
 
 bool VoiceNetwork::IsConnected() const { return impl_->connected.load(); }
 uint32_t VoiceNetwork::SessionID() const { return impl_->session_id.load(); }
+uint32_t VoiceNetwork::PlayerID()  const { return impl_->player_id_resolved.load(); }
 
 }  // namespace voice

@@ -37,6 +37,15 @@ private:
 
 // ---- Playback / mixer -----------------------------------------------
 
+// One row of GetSpeakerInfos output — the overlay uses it to render
+// the live speaker list with per-source mute controls.
+struct SpeakerInfo {
+    uint32_t src_id;
+    float    gain;          // last-applied gain (0..1, before mute)
+    bool     muted;
+    int      ms_since_mix;  // how long ago this source last produced audio
+};
+
 class AudioPlayback {
 public:
     AudioPlayback();
@@ -60,6 +69,21 @@ public:
 
     // Number of sources that mixed audio in the last 100 ms.
     int ActiveSpeakers();
+
+    // Snapshot of all known sources with current state. Cheap; the
+    // overlay calls this once per frame to populate its list.
+    void GetSpeakerInfos(SpeakerInfo* out, size_t cap, size_t& count);
+
+    // Master output gain. 0..2, defaults to 1.0. Applied to every
+    // source after per-source gain but before mute.
+    void  SetMasterVolume(float gain);
+    float GetMasterVolume() const;
+
+    // Per-source mute toggle. Muted sources don't contribute to mix
+    // but ARE still tracked (ring buffer keeps growing — caller must
+    // be ok with that). Pass true to silence, false to unmute.
+    void SetSourceMuted(uint32_t src_id, bool muted);
+    bool IsSourceMuted(uint32_t src_id);
 
 private:
     struct Impl;

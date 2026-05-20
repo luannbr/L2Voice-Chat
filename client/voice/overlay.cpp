@@ -18,6 +18,7 @@
 // game.
 
 #include "overlay.h"
+#include "audio_io.h"     // SpeakerInfo
 #include "voice.h"
 
 #include <windows.h>
@@ -49,8 +50,9 @@ WNDPROC         g_origWndProc  = nullptr;
 HWND            g_targetHwnd   = nullptr;
 ImGuiContext*   g_imguiCtx     = nullptr;
 std::atomic<bool> g_imguiBackendInit{false};
-std::atomic<bool> g_visible{true};   // toggle with Insert
-int             g_toggleVk     = VK_INSERT;
+std::atomic<bool> g_visible{true};       // toggle with Insert
+int             g_toggleVk      = VK_INSERT;
+std::atomic<bool> g_captureNextKey{false};  // PTT rebind: capture next WM_KEYDOWN
 
 void Logf(const char* fmt, ...) {
     char buf[256];
@@ -65,22 +67,32 @@ void DrawPanel() {
 
     OverlayState st = SnapshotOverlayState();
 
+    // Stay hidden until the player has actually entered the world.
+    // session_id is set in the auth_ok handler, which only fires after
+    // the bridge resolves our player_id from the GS TCP table → that
+    // happens once the L2 client is past character-select and in-game.
+    if (st.session_id == 0) return;
+
     ImGui::SetNextWindowBgAlpha(0.85f);
-    ImGui::SetNextWindowSize(ImVec2(320, 220), ImGuiCond_FirstUseEver);
-    if (!ImGui::Begin("l2voice", nullptr,
-            ImGuiWindowFlags_NoCollapse)) {
+    ImGui::SetNextWindowSize(ImVec2(340, 380), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("l2voice", nullptr, ImGuiWindowFlags_NoCollapse)) {
         ImGui::End();
         return;
     }
 
-    // ---- Connection status ----
+    // ---- Status ----
     ImGui::Text("ws: %s   sid=%u   player=%u",
         st.ws_connected ? "connected" : "DISCONNECTED",
         st.session_id, st.player_id);
-    ImGui::Text("active speakers: %d", st.active_speakers);
     ImGui::Separator();
 
-    // ---- Capture mode ----
+    // ---- Master volume ----
+    float vol = st.master_volume;
+    if (ImGui::SliderFloat("master volume", &vol, 0.0f, 2.0f, "%.2f")) {
+        SetMasterVolume(vol);
+    }
+
+    // ---- Capture toggles ----
     bool focus = st.require_focus;
     if (ImGui::Checkbox("require window focus", &focus)) {
         SetRequireFocus(focus);
@@ -89,12 +101,44 @@ void DrawPanel() {
     if (ImGui::Checkbox("always on (no PTT)", &on)) {
         SetAlwaysOn(on);
     }
-    ImGui::Text("PTT key vk=%d", st.ptt_proximity_vk);
 
-    // ---- TODO panels in next iteration: ----
-    // - Master volume slider (needs AudioPlayback API)
-    // - Per-speaker mute list (needs sid + name resolution)
-    // - PTT rebind "press a key" UI
+    // ---- PTT rebind ----
+    bool capturing = g_captureNextKey.load();
+    if (capturing) {
+        ImGui::TextColored(ImVec4(1.f, 0.7f, 0.2f, 1.f),
+            "PRESS ANY KEY (Esc to cancel)");
+    } else {
+        ImGui::Text("PTT key vk=%d", st.ptt_proximity_vk);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("rebind")) {
+            g_captureNextKey.store(true);
+        }
+    }
+    ImGui::Separator();
+
+    // ---- Speaker list with mute checkboxes ----
+    ImGui::Text("speakers (%d active):", st.active_speakers);
+    SpeakerInfo infos[16];
+    size_t n = 0;
+    GetSpeakerList(infos, 16, n);
+    if (n == 0) {
+        ImGui::TextDisabled("  (no one nearby)");
+    }
+    for (size_t i = 0; i < n; ++i) {
+        ImGui::PushID((int)infos[i].src_id);
+        bool m = infos[i].muted;
+        if (ImGui::Checkbox("##mute", &m)) {
+            SetSpeakerMuted(infos[i].src_id, m);
+        }
+        ImGui::SameLine();
+        bool speaking = infos[i].ms_since_mix < 200;
+        ImVec4 col = speaking ? ImVec4(0.4f, 1.f, 0.4f, 1.f)
+                              : ImVec4(0.6f, 0.6f, 0.6f, 1.f);
+        ImGui::TextColored(col, "sid=%u  gain=%.2f  %s",
+            infos[i].src_id, infos[i].gain,
+            speaking ? "<speaking>" : "");
+        ImGui::PopID();
+    }
 
     ImGui::Separator();
     ImGui::TextDisabled("Insert to hide");
@@ -107,6 +151,23 @@ LRESULT CALLBACK HookedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         bool prev = g_visible.exchange(!g_visible.load());
         Logf("[l2voice] overlay toggled %s\n", prev ? "OFF" : "ON");
         return 0;
+    }
+    // PTT rebind capture: next non-modifier WM_KEYDOWN becomes the
+    // new PTT key. Esc cancels.
+    if (msg == WM_KEYDOWN && g_captureNextKey.load()) {
+        int vk = (int)wp;
+        // Filter out modifier-only presses; let them through to ImGui.
+        if (vk != VK_SHIFT && vk != VK_CONTROL && vk != VK_MENU &&
+            vk != VK_LSHIFT && vk != VK_RSHIFT &&
+            vk != VK_LCONTROL && vk != VK_RCONTROL &&
+            vk != VK_LMENU && vk != VK_RMENU) {
+            g_captureNextKey.store(false);
+            if (vk != VK_ESCAPE) {
+                SetPttProximityVk(vk);
+                Logf("[l2voice] PTT rebound to vk=%d\n", vk);
+            }
+            return 0;
+        }
     }
     if (g_imguiBackendInit.load() &&
             ImGui_ImplWin32_WndProcHandler(hwnd, msg, wp, lp)) {

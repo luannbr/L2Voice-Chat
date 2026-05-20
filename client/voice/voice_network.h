@@ -70,6 +70,9 @@ public:
 
     bool IsConnected() const;
     uint32_t SessionID() const;
+    // Player id that the voice-service resolved for this session
+    // (forwarded back in auth_ok). 0 until auth_ok arrives.
+    uint32_t PlayerID() const;
 
 private:
     struct Impl;

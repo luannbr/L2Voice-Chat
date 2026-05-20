@@ -67,6 +67,7 @@ struct Source {
     // from L2J positions in protocol rev 2). No spatial math here.
     float    gain  = 0.0f;       // 0..1
     float    pan   = 0.0f;       // -1..+1
+    bool     muted = false;
     std::chrono::steady_clock::time_point last_mix{};
 };
 
@@ -133,6 +134,7 @@ struct AudioPlayback::Impl {
     ma_device device{};
     std::mutex sources_mu;
     std::unordered_map<uint32_t, Source> sources;
+    std::atomic<float> master_gain{1.0f};
     bool running = false;
 
     // Equal-power pan: pan in [-1, +1] → (left, right) gains.
@@ -149,9 +151,17 @@ struct AudioPlayback::Impl {
         int16_t* out = static_cast<int16_t*>(output);
         std::memset(out, 0, frame_count * kPlaybackChannels * sizeof(int16_t));
 
+        float master = self->master_gain.load(std::memory_order_relaxed);
         std::lock_guard<std::mutex> lk(self->sources_mu);
         for (auto& [id, src] : self->sources) {
             if (src.ring.Available() == 0) continue;
+            if (src.muted) {
+                // Still drain the ring so it doesn't grow unbounded.
+                int16_t skip[1024];
+                ma_uint32 n = frame_count > 1024 ? 1024 : frame_count;
+                src.ring.Pop(skip, n);
+                continue;
+            }
 
             int16_t mono[1024];
             ma_uint32 n = frame_count > 1024 ? 1024 : frame_count;
@@ -160,7 +170,7 @@ struct AudioPlayback::Impl {
 
             float lpan, rpan;
             PanGains(src.pan, lpan, rpan);
-            float gain = src.gain;
+            float gain = src.gain * master;
 
             for (uint32_t i = 0; i < got; ++i) {
                 int32_t l = out[i * 2 + 0] + (int32_t)(mono[i] * lpan * gain);
@@ -232,6 +242,42 @@ int AudioPlayback::ActiveSpeakers() {
         if (ms < (long long)kIdleTimeoutMs) ++count;
     }
     return count;
+}
+
+void AudioPlayback::GetSpeakerInfos(SpeakerInfo* out, size_t cap, size_t& count) {
+    auto now = std::chrono::steady_clock::now();
+    count = 0;
+    std::lock_guard<std::mutex> lk(impl_->sources_mu);
+    for (auto& [id, src] : impl_->sources) {
+        if (count >= cap) break;
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      now - src.last_mix).count();
+        out[count].src_id       = id;
+        out[count].gain         = src.gain;
+        out[count].muted        = src.muted;
+        out[count].ms_since_mix = (int)ms;
+        ++count;
+    }
+}
+
+void  AudioPlayback::SetMasterVolume(float gain) {
+    if (gain < 0.f) gain = 0.f;
+    if (gain > 2.f) gain = 2.f;
+    impl_->master_gain.store(gain, std::memory_order_relaxed);
+}
+float AudioPlayback::GetMasterVolume() const {
+    return impl_->master_gain.load(std::memory_order_relaxed);
+}
+
+void AudioPlayback::SetSourceMuted(uint32_t src_id, bool muted) {
+    std::lock_guard<std::mutex> lk(impl_->sources_mu);
+    auto it = impl_->sources.find(src_id);
+    if (it != impl_->sources.end()) it->second.muted = muted;
+}
+bool AudioPlayback::IsSourceMuted(uint32_t src_id) {
+    std::lock_guard<std::mutex> lk(impl_->sources_mu);
+    auto it = impl_->sources.find(src_id);
+    return it != impl_->sources.end() && it->second.muted;
 }
 
 }  // namespace voice

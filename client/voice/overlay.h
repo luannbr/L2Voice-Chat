@@ -29,13 +29,14 @@ void UninstallOverlay();
 // (Defined here so overlay.cpp doesn't have to pull voice.cpp's
 // internal Mod type into a header.)
 struct OverlayState {
-    bool   ws_connected;
+    bool     ws_connected;
     uint32_t session_id;
     uint32_t player_id;
-    int    active_speakers;
-    bool   require_focus;
-    bool   always_on;
-    int    ptt_proximity_vk;
+    int      active_speakers;
+    bool     require_focus;
+    bool     always_on;
+    int      ptt_proximity_vk;
+    float    master_volume;     // 0..2, default 1.0
 };
 
 OverlayState SnapshotOverlayState();
@@ -46,5 +47,11 @@ OverlayState SnapshotOverlayState();
 void SetRequireFocus(bool v);
 void SetAlwaysOn(bool v);
 void SetPttProximityVk(int vk);
+void SetMasterVolume(float gain);
+
+// Speaker list for the overlay. SpeakerInfo lives in audio_io.h.
+struct SpeakerInfo;
+void GetSpeakerList(SpeakerInfo* out, size_t cap, size_t& count);
+void SetSpeakerMuted(uint32_t src_id, bool muted);
 
 }  // namespace voice

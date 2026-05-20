@@ -316,17 +316,25 @@ OverlayState SnapshotOverlayState() {
     OverlayState s{};
     s.ws_connected     = g_mod.net.IsConnected();
     s.session_id       = g_mod.net.SessionID();
-    s.player_id        = 0;  // resolved server-side; not surfaced back to DLL yet
+    s.player_id        = g_mod.net.PlayerID();
     s.active_speakers  = g_mod.playback.ActiveSpeakers();
     s.require_focus    = g_mod.cfg.require_focus;
     s.always_on        = g_mod.cfg.always_on;
     s.ptt_proximity_vk = g_mod.cfg.ptt_proximity;
+    s.master_volume    = g_mod.playback.GetMasterVolume();
     return s;
 }
 
 void SetRequireFocus(bool v)    { g_mod.cfg.require_focus = v; }
 void SetAlwaysOn(bool v)        { g_mod.cfg.always_on     = v; }
 void SetPttProximityVk(int vk)  { g_mod.cfg.ptt_proximity = vk; }
+void SetMasterVolume(float g)   { g_mod.playback.SetMasterVolume(g); }
+void GetSpeakerList(SpeakerInfo* out, size_t cap, size_t& count) {
+    g_mod.playback.GetSpeakerInfos(out, cap, count);
+}
+void SetSpeakerMuted(uint32_t src_id, bool muted) {
+    g_mod.playback.SetSourceMuted(src_id, muted);
+}
 
 void OnRenderFrame() {
     // Refresh the TCP-port list periodically — by the time the user
