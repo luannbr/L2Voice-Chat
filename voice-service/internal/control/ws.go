@@ -29,8 +29,15 @@ import (
 // know which player a WS connection belongs to without it.
 var whoamiEndpoint string
 
+// NameEndpoint is the URL of the L2J bridge /voice/name endpoint.
+// Optional — when empty, name_query messages get an empty name back.
+var nameEndpoint string
+
 // SetWhoamiEndpoint configures the L2J bridge URL. Called once at startup.
 func SetWhoamiEndpoint(url string) { whoamiEndpoint = url }
+
+// SetNameEndpoint configures the bridge /voice/name URL.
+func SetNameEndpoint(url string) { nameEndpoint = url }
 
 // authMsg is the first message a client must send.
 type authMsg struct {
@@ -171,21 +178,63 @@ func handleWS(ctx context.Context, w http.ResponseWriter, r *http.Request, state
 	// timeout for liveness checks.
 	conn.SetReadDeadline(time.Time{})
 
-	// Keep the connection alive. We don't process any further
-	// messages yet (state_update, mute, channel_join/leave come
-	// when we add party/clan/ally). Just block on read so the
-	// connection's lifetime tracks the session's lifetime.
+	// Post-auth read loop. Currently handles one message type:
+	//   name_query → look up the player_id of the requested sid via
+	//   the topology table, then ask the bridge for the character
+	//   name, reply with name_result. Everything else is ignored.
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
 		}
-		if _, _, err := conn.ReadMessage(); err != nil {
+		_, raw, err := conn.ReadMessage()
+		if err != nil {
 			log.Printf("control: session %d closed (%v)", sess.ID, err)
 			return
 		}
+		var hdr struct {
+			Type  string `json:"type"`
+			SrcID uint32 `json:"src_id"`
+		}
+		if err := json.Unmarshal(raw, &hdr); err != nil {
+			continue
+		}
+		if hdr.Type == "name_query" && hdr.SrcID != 0 {
+			handleNameQuery(conn, state, hdr.SrcID)
+		}
 	}
+}
+
+// handleNameQuery resolves the character name for a sid the WS client
+// is asking about and sends back name_result.
+func handleNameQuery(conn *websocket.Conn, state *topology.State, srcID uint32) {
+	target := state.LookupBySID(srcID)
+	type nameResult struct {
+		Type   string `json:"type"`
+		SrcID  uint32 `json:"src_id"`
+		Name   string `json:"name"`
+	}
+	out := nameResult{Type: "name_result", SrcID: srcID}
+	if target == nil || target.PlayerID == 0 || nameEndpoint == "" {
+		_ = conn.WriteJSON(out)
+		return
+	}
+	url := fmt.Sprintf("%s?player_id=%d", nameEndpoint, target.PlayerID)
+	client := http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		_ = conn.WriteJSON(out)
+		return
+	}
+	defer resp.Body.Close()
+	var body struct {
+		PlayerID uint32 `json:"player_id"`
+		Name     string `json:"name"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&body)
+	out.Name = body.Name
+	_ = conn.WriteJSON(out)
 }
 
 // udpEndpointFor builds the udp_endpoint string returned in auth_ok.

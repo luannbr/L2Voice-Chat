@@ -26,6 +26,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace voice {
@@ -90,6 +91,12 @@ struct VoiceNetwork::Impl {
     ix::WebSocket ws;
     std::thread udp_thread;
     std::atomic<bool> stopping{false};
+
+    // sid → character name cache. Populated by name_result messages
+    // from the voice-service. Read by the overlay every frame.
+    std::mutex names_mu;
+    std::unordered_map<uint32_t, std::string> name_cache;
+    std::unordered_map<uint32_t, bool> name_query_inflight;
 
     bool InitWinsock() {
         WSADATA wsa;
@@ -211,6 +218,21 @@ struct VoiceNetwork::Impl {
     }
 
     void HandleWsMessage(const std::string& s) {
+        // name_result {type, src_id, name}
+        if (s.find("\"name_result\"") != std::string::npos) {
+            uint64_t sid_u = 0;
+            std::string nm;
+            ExtractNumber(s, "src_id", sid_u);
+            ExtractString(s, "name", nm);
+            {
+                std::lock_guard<std::mutex> lk(names_mu);
+                name_query_inflight.erase((uint32_t)sid_u);
+                if (!nm.empty()) {
+                    name_cache[(uint32_t)sid_u] = nm;
+                }
+            }
+            return;
+        }
         if (s.find("\"auth_ok\"") == std::string::npos) {
             // Other message types (auth_fail, topology_update, etc.) —
             // not handled in this minimal client.
@@ -344,5 +366,31 @@ void VoiceNetwork::SendKeepalive() {
 bool VoiceNetwork::IsConnected() const { return impl_->connected.load(); }
 uint32_t VoiceNetwork::SessionID() const { return impl_->session_id.load(); }
 uint32_t VoiceNetwork::PlayerID()  const { return impl_->player_id_resolved.load(); }
+
+void VoiceNetwork::SendNameQuery(uint32_t src_id) {
+    if (!impl_->connected.load() || src_id == 0) return;
+    {
+        std::lock_guard<std::mutex> lk(impl_->names_mu);
+        if (impl_->name_cache.count(src_id)) return;          // already known
+        if (impl_->name_query_inflight.count(src_id)) return; // already asked
+        impl_->name_query_inflight[src_id] = true;
+    }
+    std::string s = "{\"type\":\"name_query\",\"src_id\":";
+    s += std::to_string(src_id);
+    s += "}";
+    impl_->ws.send(s);
+}
+
+bool VoiceNetwork::CachedName(uint32_t src_id, char* out, size_t cap) {
+    if (cap == 0) return false;
+    std::lock_guard<std::mutex> lk(impl_->names_mu);
+    auto it = impl_->name_cache.find(src_id);
+    if (it == impl_->name_cache.end()) { out[0] = 0; return false; }
+    size_t n = it->second.size();
+    if (n >= cap) n = cap - 1;
+    memcpy(out, it->second.data(), n);
+    out[n] = 0;
+    return true;
+}
 
 }  // namespace voice

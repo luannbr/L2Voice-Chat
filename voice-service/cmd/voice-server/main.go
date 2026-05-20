@@ -33,6 +33,7 @@ func main() {
 	redisAddr := flag.String("redis", "", "Redis broker for L2J event subscription (host:port; empty = disabled)")
 	redisChan := flag.String("redis-chan", "l2voice:events", "Redis pub/sub channel")
 	l2jWhoami := flag.String("l2j-whoami", "http://127.0.0.1:17668/voice/whoami", "L2J bridge /voice/whoami URL for TCP source-port → player_id resolution (required)")
+	l2jName := flag.String("l2j-name", "http://127.0.0.1:17668/voice/name", "L2J bridge /voice/name URL for player_id → character name lookup (optional)")
 	echo := flag.Bool("echo", false, "echo every proximity packet back to the sender (loopback test mode)")
 	flag.Parse()
 
@@ -45,7 +46,9 @@ func main() {
 	// Wire the L2J /voice/whoami endpoint. Required — voice-service can't
 	// resolve a WS connection's player_id without it.
 	control.SetWhoamiEndpoint(*l2jWhoami)
+	control.SetNameEndpoint(*l2jName)
 	log.Printf("control: resolving player_id via %s", *l2jWhoami)
+	log.Printf("control: resolving character names via %s", *l2jName)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

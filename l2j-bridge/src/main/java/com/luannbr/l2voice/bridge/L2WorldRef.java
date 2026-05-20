@@ -22,6 +22,7 @@ final class L2WorldRef {
     private final Method getClient;          // L2PcInstance.getClient()
     private final Method getConnection;      // L2GameClient.getConnection()
     private final Method getSocketChannel;   // MMOConnection.getSocketChannel()
+    private final Method getName;            // L2PcInstance.getName()
 
     L2WorldRef() throws Exception {
         Class<?> world = Class.forName("net.l2emuproject.gameserver.model.L2World");
@@ -35,6 +36,7 @@ final class L2WorldRef {
         getZ          = pc.getMethod("getZ");
         getInstanceId = pc.getMethod("getInstanceId");
         getClient     = pc.getMethod("getClient");
+        getName       = pc.getMethod("getName");
 
         Class<?> gameClient = Class.forName(
                 "net.l2emuproject.gameserver.network.L2GameClient");
@@ -108,6 +110,24 @@ final class L2WorldRef {
     private static boolean isLoopback(String s) {
         return s.equals("127.0.0.1") || s.equals("0:0:0:0:0:0:0:1")
                 || s.equals("::1") || s.equalsIgnoreCase("localhost");
+    }
+
+    /** Returns the character name for an online player, or null. */
+    String getPlayerName(int objId) throws Exception {
+        Object res = getAllPlayers.invoke(null);
+        Iterable<?> iter;
+        if (res instanceof Iterable<?> it)     iter = it;
+        else if (res instanceof Object[] arr)  iter = java.util.Arrays.asList(arr);
+        else if (res instanceof java.util.Map<?, ?> m) iter = m.values();
+        else                                   return null;
+        for (Object p : iter) {
+            if (p == null) continue;
+            if ((int) getObjectId.invoke(p) == objId) {
+                Object name = getName.invoke(p);
+                return name == null ? null : name.toString();
+            }
+        }
+        return null;
     }
 
     boolean containsPlayer(int objId) throws Exception {

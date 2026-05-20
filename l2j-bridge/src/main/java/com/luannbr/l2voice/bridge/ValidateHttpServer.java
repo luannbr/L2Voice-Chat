@@ -56,6 +56,7 @@ final class ValidateHttpServer {
             server.createContext("/voice/validate", this::handleValidate);
             server.createContext("/voice/check",    this::handleCheck);
             server.createContext("/voice/whoami",   this::handleWhoami);
+            server.createContext("/voice/name",     this::handleName);
             server.setExecutor(null);     // single thread; load is trivial
             server.start();
             log.info("validate HTTP server listening on " + bind + ":" + port);
@@ -159,6 +160,30 @@ final class ValidateHttpServer {
         }
         log.info("whoami ip=" + ip + " ports=" + ports + " -> player_id=" + pid);
         respond(ex, 200, "{\"player_id\":" + pid + "}");
+    }
+
+    /** GET /voice/name?player_id=N → {"player_id":N,"name":"..."} */
+    private void handleName(HttpExchange ex) throws IOException {
+        if (!"GET".equalsIgnoreCase(ex.getRequestMethod())) {
+            respond(ex, 405, "{\"name\":null}");
+            return;
+        }
+        String q = ex.getRequestURI().getRawQuery();
+        int pid = parseQueryInt(q, "player_id");
+        if (pid == 0) {
+            respond(ex, 400, "{\"name\":null,\"reason\":\"missing_player_id\"}");
+            return;
+        }
+        String name = null;
+        if (worldRef != null) {
+            try { name = worldRef.getPlayerName(pid); }
+            catch (Throwable t) {
+                log.log(Level.WARNING, "getPlayerName failed", t);
+            }
+        }
+        String quoted = name == null ? "null"
+            : "\"" + name.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
+        respond(ex, 200, "{\"player_id\":" + pid + ",\"name\":" + quoted + "}");
     }
 
     private static String parseQueryStr(String q, String key) {

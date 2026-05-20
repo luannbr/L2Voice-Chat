@@ -54,6 +54,37 @@ std::atomic<bool> g_visible{true};       // toggle with Insert
 int             g_toggleVk      = VK_INSERT;
 std::atomic<bool> g_captureNextKey{false};  // PTT rebind: capture next WM_KEYDOWN
 
+// Renders a VK code as a readable label (e.g., "H", "Mouse 4",
+// "F1"). Falls back to "vk=N" for codes we don't have a mnemonic
+// for. Mostly used by the overlay's PTT display + rebind UI.
+void VkToString(int vk, char* out, size_t cap) {
+    if (cap == 0) return;
+    const char* fixed = nullptr;
+    switch (vk) {
+        case VK_LBUTTON:  fixed = "Mouse L"; break;
+        case VK_RBUTTON:  fixed = "Mouse R"; break;
+        case VK_MBUTTON:  fixed = "Mouse M"; break;
+        case VK_XBUTTON1: fixed = "Mouse 4"; break;
+        case VK_XBUTTON2: fixed = "Mouse 5"; break;
+        case VK_TAB:      fixed = "Tab"; break;
+        case VK_CAPITAL:  fixed = "CapsLock"; break;
+        case VK_SPACE:    fixed = "Space"; break;
+        case VK_INSERT:   fixed = "Insert"; break;
+        case VK_HOME:     fixed = "Home"; break;
+        case VK_END:      fixed = "End"; break;
+        case VK_PRIOR:    fixed = "PgUp"; break;
+        case VK_NEXT:     fixed = "PgDn"; break;
+        case VK_OEM_3:    fixed = "`"; break;
+    }
+    if (fixed) { _snprintf_s(out, cap, _TRUNCATE, "%s", fixed); return; }
+    if (vk >= 'A' && vk <= 'Z') { _snprintf_s(out, cap, _TRUNCATE, "%c", vk); return; }
+    if (vk >= '0' && vk <= '9') { _snprintf_s(out, cap, _TRUNCATE, "%c", vk); return; }
+    if (vk >= VK_F1 && vk <= VK_F24) {
+        _snprintf_s(out, cap, _TRUNCATE, "F%d", vk - VK_F1 + 1); return;
+    }
+    _snprintf_s(out, cap, _TRUNCATE, "vk=%d", vk);
+}
+
 void Logf(const char* fmt, ...) {
     char buf[256];
     va_list ap; va_start(ap, fmt);
@@ -106,9 +137,11 @@ void DrawPanel() {
     bool capturing = g_captureNextKey.load();
     if (capturing) {
         ImGui::TextColored(ImVec4(1.f, 0.7f, 0.2f, 1.f),
-            "PRESS ANY KEY (Esc to cancel)");
+            "PRESS ANY KEY OR MOUSE BUTTON (Esc to cancel)");
     } else {
-        ImGui::Text("PTT key vk=%d", st.ptt_proximity_vk);
+        char vkLabel[32];
+        VkToString(st.ptt_proximity_vk, vkLabel, sizeof(vkLabel));
+        ImGui::Text("PTT key: %s", vkLabel);
         ImGui::SameLine();
         if (ImGui::SmallButton("rebind")) {
             g_captureNextKey.store(true);
@@ -134,9 +167,16 @@ void DrawPanel() {
         bool speaking = infos[i].ms_since_mix < 200;
         ImVec4 col = speaking ? ImVec4(0.4f, 1.f, 0.4f, 1.f)
                               : ImVec4(0.6f, 0.6f, 0.6f, 1.f);
-        ImGui::TextColored(col, "sid=%u  gain=%.2f  %s",
-            infos[i].src_id, infos[i].gain,
-            speaking ? "<speaking>" : "");
+        char name[48];
+        bool haveName = GetSpeakerName(infos[i].src_id, name, sizeof(name));
+        if (haveName) {
+            ImGui::TextColored(col, "%s  gain=%.2f%s",
+                name, infos[i].gain, speaking ? "  <speaking>" : "");
+        } else {
+            ImGui::TextColored(col, "sid=%u  gain=%.2f%s",
+                infos[i].src_id, infos[i].gain,
+                speaking ? "  <speaking>" : "");
+        }
         ImGui::PopID();
     }
 
@@ -152,20 +192,36 @@ LRESULT CALLBACK HookedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         Logf("[l2voice] overlay toggled %s\n", prev ? "OFF" : "ON");
         return 0;
     }
-    // PTT rebind capture: next non-modifier WM_KEYDOWN becomes the
-    // new PTT key. Esc cancels.
-    if (msg == WM_KEYDOWN && g_captureNextKey.load()) {
-        int vk = (int)wp;
-        // Filter out modifier-only presses; let them through to ImGui.
-        if (vk != VK_SHIFT && vk != VK_CONTROL && vk != VK_MENU &&
-            vk != VK_LSHIFT && vk != VK_RSHIFT &&
-            vk != VK_LCONTROL && vk != VK_RCONTROL &&
-            vk != VK_LMENU && vk != VK_RMENU) {
-            g_captureNextKey.store(false);
-            if (vk != VK_ESCAPE) {
-                SetPttProximityVk(vk);
-                Logf("[l2voice] PTT rebound to vk=%d\n", vk);
+    // PTT rebind capture. Accepts:
+    //   - WM_KEYDOWN (any non-modifier key, Esc cancels)
+    //   - WM_RBUTTONDOWN / WM_MBUTTONDOWN / WM_XBUTTONDOWN (mouse buttons
+    //     other than LMB — LMB is excluded because it's also how the
+    //     user clicked the "rebind" button)
+    if (g_captureNextKey.load()) {
+        int capturedVk = 0;
+        bool cancel = false;
+        if (msg == WM_KEYDOWN) {
+            int vk = (int)wp;
+            if (vk == VK_ESCAPE) { cancel = true; }
+            else if (vk != VK_SHIFT && vk != VK_CONTROL && vk != VK_MENU &&
+                     vk != VK_LSHIFT && vk != VK_RSHIFT &&
+                     vk != VK_LCONTROL && vk != VK_RCONTROL &&
+                     vk != VK_LMENU && vk != VK_RMENU) {
+                capturedVk = vk;
             }
+        } else if (msg == WM_RBUTTONDOWN) capturedVk = VK_RBUTTON;
+        else if (msg == WM_MBUTTONDOWN)  capturedVk = VK_MBUTTON;
+        else if (msg == WM_XBUTTONDOWN) {
+            capturedVk = (HIWORD(wp) == XBUTTON1) ? VK_XBUTTON1 : VK_XBUTTON2;
+        }
+        if (cancel) {
+            g_captureNextKey.store(false);
+            return 0;
+        }
+        if (capturedVk != 0) {
+            g_captureNextKey.store(false);
+            SetPttProximityVk(capturedVk);
+            Logf("[l2voice] PTT rebound to vk=%d\n", capturedVk);
             return 0;
         }
     }

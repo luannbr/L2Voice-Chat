@@ -54,4 +54,9 @@ struct SpeakerInfo;
 void GetSpeakerList(SpeakerInfo* out, size_t cap, size_t& count);
 void SetSpeakerMuted(uint32_t src_id, bool muted);
 
+// Resolves the character name for a speaker. Returns true + fills out
+// when known, false otherwise. Triggers an async query the first time
+// — the cache fills in within ~50 ms typically.
+bool GetSpeakerName(uint32_t src_id, char* out, size_t cap);
+
 }  // namespace voice

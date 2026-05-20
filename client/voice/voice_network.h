@@ -74,6 +74,13 @@ public:
     // (forwarded back in auth_ok). 0 until auth_ok arrives.
     uint32_t PlayerID() const;
 
+    // Asks the voice-service for the character name behind a given
+    // session id. Result arrives asynchronously and is cached;
+    // CachedName fills out the buffer with whatever's known. Empty
+    // string until the server replies.
+    void SendNameQuery(uint32_t src_id);
+    bool CachedName(uint32_t src_id, char* out, size_t cap);
+
 private:
     struct Impl;
     Impl* impl_;

@@ -120,6 +120,11 @@ void OnCaptureFrame(const int16_t* pcm, uint32_t samples) {
 void OnIncomingPacket(uint8_t channel, uint32_t src, uint16_t /*seq*/,
                       uint8_t gain_u8, int8_t pan_i8,
                       const uint8_t* opus_payload, uint16_t opus_len) {
+    // Make sure we have a name on file for the speaker so the overlay
+    // can label them. Cheap — VoiceNetwork dedupes inflight queries
+    // and cached names skip the WS roundtrip.
+    g_mod.net.SendNameQuery(src);
+
     static uint32_t rx = 0;
     if ((++rx % 50) == 1) {
         char dbg[160];
@@ -334,6 +339,12 @@ void GetSpeakerList(SpeakerInfo* out, size_t cap, size_t& count) {
 }
 void SetSpeakerMuted(uint32_t src_id, bool muted) {
     g_mod.playback.SetSourceMuted(src_id, muted);
+}
+
+bool GetSpeakerName(uint32_t src_id, char* out, size_t cap) {
+    // Side-effect: kick off a query if we don't have it yet.
+    g_mod.net.SendNameQuery(src_id);
+    return g_mod.net.CachedName(src_id, out, cap);
 }
 
 void OnRenderFrame() {
