@@ -1,0 +1,413 @@
+<h2 class="sr-only">Galeria de 12 designs para o overlay de voz l2voice</h2>
+
+<style>
+.gallery { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding: 1rem 0; }
+.tile { background: var(--color-background-secondary); border-radius: var(--border-radius-lg); padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+.tile-label { font-size: 12px; color: var(--color-text-secondary); display: flex; justify-content: space-between; align-items: center; }
+.tile-num { font-size: 11px; color: var(--color-text-tertiary); font-family: var(--font-mono); }
+.mock { border-radius: 10px; padding: 14px; font-family: var(--font-sans); font-size: 12px; min-height: 220px; display: flex; flex-direction: column; gap: 10px; }
+
+/* === 1. DARK GLASS === */
+.m1 { background: linear-gradient(160deg, rgba(20,22,30,0.92), rgba(15,17,24,0.92)); color: #e8eaf0; border: 1px solid rgba(255,255,255,0.08); backdrop-filter: blur(20px); }
+.m1 .row { display: flex; justify-content: space-between; align-items: center; padding: 6px 0; }
+.m1 .head { display: flex; justify-content: space-between; align-items: center; padding-bottom: 8px; border-bottom: 1px solid rgba(255,255,255,0.06); }
+.m1 .dot { width: 7px; height: 7px; border-radius: 50%; background: #4ade80; box-shadow: 0 0 8px #4ade80; display: inline-block; margin-right: 6px; }
+.m1 .title { font-weight: 500; letter-spacing: 0.3px; }
+.m1 .muted { color: #8b92a3; font-size: 11px; }
+.m1 .slider { width: 100%; height: 4px; background: rgba(255,255,255,0.08); border-radius: 2px; position: relative; }
+.m1 .slider::after { content:''; position:absolute; left:0; top:0; height:100%; width: 70%; background: #818cf8; border-radius: 2px; }
+.m1 .slider::before { content:''; position:absolute; left:68%; top:-4px; width:12px; height:12px; background:#818cf8; border-radius:50%; }
+.m1 .chip { background: rgba(129,140,248,0.15); color: #a5b4fc; padding: 3px 8px; border-radius: 6px; font-size: 10px; font-family: var(--font-mono); }
+.m1 .check { width:14px; height:14px; border-radius:4px; border: 1.5px solid rgba(255,255,255,0.2); display:inline-block; vertical-align:middle; margin-right:8px; position: relative; }
+.m1 .check.on { background:#818cf8; border-color:#818cf8; }
+.m1 .check.on::after { content:'✓'; color:white; position:absolute; left:1px; top:-3px; font-size:11px; }
+
+/* === 2. CYBERPUNK === */
+.m2 { background: #0a0612; color: #e0d4ff; border: 1px solid #ff00ff44; position: relative; font-family: 'Courier New', monospace; }
+.m2::before { content:''; position:absolute; top:-1px; left:8px; right:8px; height:1px; background: linear-gradient(90deg, transparent, #00ffff, transparent); }
+.m2 .head { color: #00ffff; font-size: 13px; letter-spacing: 2px; text-transform: lowercase; border-bottom: 1px dashed #ff00ff66; padding-bottom: 8px; }
+.m2 .head span { color: #ff00ff; }
+.m2 .row { display: flex; justify-content: space-between; font-size: 11px; padding: 3px 0; }
+.m2 .label { color: #9d7fcf; }
+.m2 .val { color: #00ffff; font-weight: 500; }
+.m2 .bar { height: 8px; background: #1a0c2e; border: 1px solid #ff00ff44; position: relative; clip-path: polygon(0 0, calc(100% - 4px) 0, 100% 50%, calc(100% - 4px) 100%, 0 100%); }
+.m2 .bar::after { content:''; position:absolute; left:0; top:0; bottom:0; width:70%; background: linear-gradient(90deg, #ff00ff, #00ffff); }
+.m2 .btn { background: transparent; border: 1px solid #00ffff; color: #00ffff; padding: 2px 10px; font-size: 10px; clip-path: polygon(6px 0, 100% 0, calc(100% - 6px) 100%, 0 100%); font-family: inherit; }
+.m2 .key { background: #ff00ff22; border: 1px solid #ff00ff; color: #ff00ff; padding: 1px 6px; font-size: 10px; }
+
+/* === 3. L2 GOTHIC === */
+.m3 { background: #1a1410; color: #e8d4a0; border: 2px solid #8b6914; position: relative; }
+.m3::before { content:''; position:absolute; inset: 3px; border: 1px solid #5a4410; pointer-events: none; }
+.m3 .head { text-align: center; color: #d4af37; font-family: 'Georgia', serif; font-size: 14px; letter-spacing: 3px; padding-bottom: 8px; border-bottom: 1px solid #5a4410; }
+.m3 .head::before, .m3 .head::after { content:'❖'; color: #8b6914; margin: 0 8px; font-size: 10px; }
+.m3 .row { display: flex; justify-content: space-between; font-size: 11px; padding: 3px 0; align-items: center; font-family: 'Georgia', serif; }
+.m3 .label { color: #a89060; font-style: italic; }
+.m3 .val { color: #f0d878; }
+.m3 .bar { height: 10px; background: #0d0a08; border: 1px solid #5a4410; position: relative; }
+.m3 .bar::after { content:''; position:absolute; left:1px; top:1px; bottom:1px; width:68%; background: linear-gradient(180deg, #d4af37, #8b6914); }
+.m3 .check { display:inline-block; width:12px; height:12px; border: 1px solid #8b6914; background: #0d0a08; margin-right:6px; vertical-align:middle; position: relative; }
+.m3 .check.on::after { content:'✦'; color:#d4af37; position:absolute; top:-4px; left:1px; font-size:11px; }
+.m3 .btn { background: #2a1f15; border: 1px solid #8b6914; color: #d4af37; padding: 2px 10px; font-size: 10px; font-family: 'Georgia', serif; font-style: italic; }
+
+/* === 4. PARCHMENT === */
+.m4 { background: #f4e8d0; color: #3d2817; border: 1px solid #8b6914; font-family: 'Georgia', serif; position: relative; }
+.m4 .head { text-align: center; color: #8b2500; font-size: 14px; font-weight: 500; padding-bottom: 8px; border-bottom: 1px solid #c4a878; font-variant: small-caps; letter-spacing: 1px; }
+.m4 .row { display: flex; justify-content: space-between; font-size: 11px; padding: 3px 0; align-items: center; }
+.m4 .label { color: #6b4423; font-style: italic; }
+.m4 .val { color: #8b2500; font-weight: 500; }
+.m4 .bar { height: 8px; background: #e0d0a8; border: 1px solid #8b6914; border-radius: 4px; position: relative; }
+.m4 .bar::after { content:''; position:absolute; left:1px; top:1px; bottom:1px; width:67%; background: #8b2500; border-radius: 3px; }
+.m4 .check { display:inline-block; width:12px; height:12px; border: 1px solid #6b4423; background: #f9f0d8; margin-right:6px; vertical-align:middle; position: relative; border-radius: 2px; }
+.m4 .check.on::after { content:'✓'; color:#8b2500; position:absolute; top:-4px; left:1px; font-size:12px; font-weight:bold; }
+.m4 .btn { background: #8b2500; border: 1px solid #5a1800; color: #f4e8d0; padding: 2px 10px; font-size: 10px; border-radius: 3px; font-family: inherit; }
+
+/* === 5. MINIMAL PILL === */
+.m5 { background: rgba(18,18,22,0.95); color: #fff; border-radius: 999px !important; padding: 8px 12px !important; min-height: 0 !important; flex-direction: row !important; align-items: center; gap: 8px !important; border: 1px solid rgba(255,255,255,0.06); justify-content: space-between; }
+.m5 .pill-status { display: flex; align-items: center; gap: 6px; font-size: 11px; }
+.m5 .pill-dot { width: 6px; height: 6px; border-radius: 50%; background: #4ade80; }
+.m5 .icon-btn { width: 26px; height: 26px; border-radius: 50%; background: rgba(255,255,255,0.06); display: flex; align-items: center; justify-content: center; font-size: 13px; }
+.m5 .icon-btn.active { background: #6366f1; }
+.m5 .ptt { background: rgba(99,102,241,0.18); color: #a5b4fc; padding: 3px 8px; border-radius: 999px; font-size: 10px; font-family: var(--font-mono); }
+.m5 .vol-mini { width: 50px; height: 3px; background: rgba(255,255,255,0.1); border-radius: 2px; position: relative; }
+.m5 .vol-mini::after { content:''; position:absolute; left:0; top:0; bottom:0; width:70%; background:#6366f1; border-radius:2px; }
+.m5-wrap { padding: 16px; min-height: 220px; display: flex; flex-direction: column; gap: 10px; justify-content: center; }
+.m5-hint { font-size: 10px; color: var(--color-text-tertiary); text-align: center; }
+.m5-expanded { background: rgba(18,18,22,0.95); border-radius: 12px; padding: 10px 12px; color: #fff; font-size: 11px; border: 1px solid rgba(255,255,255,0.06); }
+.m5-expanded .erow { display: flex; justify-content: space-between; padding: 3px 0; opacity: 0.7; }
+
+/* === 6. DISCORD-STYLE === */
+.m6 { background: #2b2d31; color: #dbdee1; border-radius: 8px; }
+.m6 .head { display: flex; justify-content: space-between; align-items: center; padding-bottom: 8px; border-bottom: 1px solid #1e1f22; }
+.m6 .head .title { font-weight: 500; font-size: 13px; color: #fff; }
+.m6 .badge { background: #248045; color: #fff; font-size: 9px; padding: 2px 6px; border-radius: 10px; font-weight: 500; }
+.m6 .row { display: flex; justify-content: space-between; align-items: center; padding: 4px 0; font-size: 11px; }
+.m6 .label { color: #b5bac1; }
+.m6 .val { color: #fff; font-family: var(--font-mono); font-size: 10px; }
+.m6 .slider { width: 100%; height: 6px; background: #1e1f22; border-radius: 3px; position: relative; }
+.m6 .slider::after { content:''; position:absolute; left:0; top:0; bottom:0; width:70%; background: #5865f2; border-radius:3px; }
+.m6 .slider::before { content:''; position:absolute; left:67%; top:-4px; width:14px; height:14px; background:#fff; border-radius:50%; }
+.m6 .toggle { width: 28px; height: 16px; background: #4e5058; border-radius: 10px; position: relative; }
+.m6 .toggle.on { background: #248045; }
+.m6 .toggle::after { content:''; position:absolute; top:2px; left:2px; width:12px; height:12px; background:#fff; border-radius:50%; }
+.m6 .toggle.on::after { left: 14px; }
+.m6 .kbd { background: #1e1f22; border: 1px solid #1e1f22; color: #b5bac1; padding: 1px 6px; border-radius: 3px; font-family: var(--font-mono); font-size: 10px; }
+.m6 .btn { background: #5865f2; color: #fff; border: none; padding: 3px 10px; border-radius: 4px; font-size: 10px; }
+
+/* === 7. SCI-FI HUD === */
+.m7 { background: rgba(5,20,35,0.95); color: #7dd3fc; border: 1px solid #0ea5e9; position: relative; }
+.m7::before, .m7::after { content:''; position:absolute; width:12px; height:12px; border: 2px solid #06b6d4; }
+.m7::before { top: -1px; left: -1px; border-right:none; border-bottom:none; }
+.m7::after { bottom: -1px; right: -1px; border-left:none; border-top:none; }
+.m7 .head { color: #06b6d4; font-size: 12px; letter-spacing: 4px; text-transform: uppercase; padding-bottom: 6px; border-bottom: 1px solid #0ea5e955; display: flex; justify-content: space-between; align-items: center; font-family: var(--font-mono); }
+.m7 .pulse { width:6px; height:6px; border-radius:50%; background:#06b6d4; box-shadow: 0 0 6px #06b6d4; }
+.m7 .row { display: flex; justify-content: space-between; align-items: center; padding: 3px 0; font-size: 10px; font-family: var(--font-mono); }
+.m7 .label { color: #67e8f9; opacity: 0.7; letter-spacing: 1px; }
+.m7 .val { color: #06b6d4; }
+.m7 .bar { height: 6px; background: rgba(6,182,212,0.1); border: 1px solid #0ea5e955; position: relative; }
+.m7 .bar::after { content:''; position:absolute; left:0; top:0; bottom:0; width:70%; background: #06b6d4; box-shadow: 0 0 8px #06b6d4; }
+.m7 .blocks { display: flex; gap: 2px; }
+.m7 .blocks span { width: 3px; height: 8px; background: #06b6d4; opacity: 0.9; }
+.m7 .blocks span:nth-child(n+8) { opacity: 0.2; }
+
+/* === 8. RETRO TERMINAL === */
+.m8 { background: #0a0e0a; color: #00ff41; border: 1px solid #00ff4144; font-family: 'Courier New', monospace; position: relative; overflow: hidden; }
+.m8::before { content:''; position:absolute; inset:0; background: repeating-linear-gradient(0deg, transparent 0, transparent 2px, rgba(0,255,65,0.04) 2px, rgba(0,255,65,0.04) 3px); pointer-events:none; }
+.m8 .head { font-size: 12px; padding-bottom: 6px; border-bottom: 1px solid #00ff4144; }
+.m8 .head::before { content:'> '; }
+.m8 .row { display: flex; justify-content: space-between; font-size: 11px; padding: 2px 0; }
+.m8 .row::before { content:'  '; }
+.m8 .label::before { content:'['; }
+.m8 .label::after { content:']'; }
+.m8 .label { color: #00ff4188; }
+.m8 .val { color: #00ff41; }
+.m8 .ascii-bar { font-size: 11px; letter-spacing: 0; color: #00ff41; }
+.m8 .blink { animation: blink 1s infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+
+/* === 9. MATERIAL DARK === */
+.m9 { background: #1e1e2e; color: #cdd6f4; border-radius: 12px; }
+.m9 .head { display: flex; align-items: center; gap: 10px; padding-bottom: 8px; }
+.m9 .head .icon { width: 28px; height: 28px; border-radius: 50%; background: #89b4fa; color: #1e1e2e; display: flex; align-items: center; justify-content: center; font-size: 14px; }
+.m9 .head .title { font-weight: 500; font-size: 13px; }
+.m9 .head .sub { font-size: 10px; color: #7f849c; }
+.m9 .card { background: #313244; border-radius: 8px; padding: 8px 10px; }
+.m9 .row { display: flex; justify-content: space-between; align-items: center; font-size: 11px; padding: 2px 0; }
+.m9 .label { color: #bac2de; }
+.m9 .val { color: #cba6f7; font-family: var(--font-mono); font-size: 10px; }
+.m9 .slider { width: 100%; height: 4px; background: #45475a; border-radius: 2px; position: relative; margin-top: 4px; }
+.m9 .slider::after { content:''; position:absolute; left:0; top:0; bottom:0; width:70%; background: #89b4fa; border-radius:2px; }
+.m9 .slider::before { content:''; position:absolute; left:68%; top:-5px; width:14px; height:14px; background:#89b4fa; border-radius:50%; }
+.m9 .toggle { width: 32px; height: 18px; background: #45475a; border-radius: 10px; position: relative; }
+.m9 .toggle.on { background: #a6e3a1; }
+.m9 .toggle::after { content:''; position:absolute; top:2px; left:2px; width:14px; height:14px; background:#fff; border-radius:50%; }
+.m9 .toggle.on::after { left: 16px; }
+
+/* === 10. RGB GAMING === */
+.m10 { background: #0d0d10; color: #fff; position: relative; border: 1px solid transparent; background-clip: padding-box; }
+.m10::before { content:''; position:absolute; inset:-1px; background: linear-gradient(120deg, #ff006e, #fb5607, #ffbe0b, #8338ec, #3a86ff, #ff006e); border-radius: 11px; z-index:-1; }
+.m10 .head { display: flex; justify-content: space-between; align-items: center; padding-bottom: 8px; border-bottom: 1px solid #ffffff10; }
+.m10 .head .title { background: linear-gradient(90deg, #ff006e, #8338ec, #3a86ff); -webkit-background-clip: text; background-clip: text; color: transparent; font-weight: 500; font-size: 13px; letter-spacing: 1px; }
+.m10 .row { display: flex; justify-content: space-between; align-items: center; font-size: 11px; padding: 3px 0; }
+.m10 .label { color: #888; font-size: 10px; }
+.m10 .val { color: #fff; font-family: var(--font-mono); font-size: 10px; }
+.m10 .slider { width: 100%; height: 4px; background: #1a1a20; border-radius: 2px; position: relative; }
+.m10 .slider::after { content:''; position:absolute; left:0; top:0; bottom:0; width:70%; background: linear-gradient(90deg, #ff006e, #3a86ff); border-radius:2px; }
+.m10 .chip { background: linear-gradient(90deg, #ff006e22, #3a86ff22); border: 1px solid #ff006e44; color: #ff006e; padding: 2px 8px; border-radius: 4px; font-size: 10px; font-family: var(--font-mono); }
+.m10 .key { background: #1a1a20; border: 1px solid #3a86ff; color: #3a86ff; padding: 1px 6px; border-radius: 3px; font-family: var(--font-mono); font-size: 10px; }
+
+/* === 11. ARCANE === */
+.m11 { background: radial-gradient(circle at top, #2d1b4e, #0f0820); color: #e9d8fd; border: 1px solid #805ad555; position: relative; }
+.m11::before, .m11::after { content:'✦'; position:absolute; color: #d6bcfa; font-size: 10px; opacity: 0.6; }
+.m11::before { top: 6px; right: 8px; }
+.m11::after { bottom: 6px; left: 8px; }
+.m11 .head { text-align: center; font-family: 'Georgia', serif; font-size: 13px; color: #d6bcfa; letter-spacing: 2px; padding-bottom: 8px; border-bottom: 1px solid #805ad533; font-variant: small-caps; }
+.m11 .row { display: flex; justify-content: space-between; font-size: 11px; padding: 3px 0; font-family: 'Georgia', serif; }
+.m11 .label { color: #b794f4; font-style: italic; }
+.m11 .val { color: #fbb6ce; }
+.m11 .bar { height: 8px; background: #1a0d3a; border: 1px solid #805ad555; border-radius: 4px; position: relative; overflow: hidden; }
+.m11 .bar::after { content:''; position:absolute; left:0; top:0; bottom:0; width:70%; background: linear-gradient(90deg, #805ad5, #d53f8c); }
+.m11 .rune { display:inline-block; width:14px; height:14px; border: 1px solid #805ad5; background: #1a0d3a; margin-right:6px; text-align: center; line-height: 12px; color: #d6bcfa; font-size: 10px; vertical-align: middle; }
+.m11 .btn { background: #2d1b4e; border: 1px solid #805ad5; color: #d6bcfa; padding: 2px 10px; font-size: 10px; border-radius: 3px; font-family: 'Georgia', serif; font-style: italic; }
+
+/* === 12. COMPACT ICON === */
+.m12 { background: #16161e; color: #fff; padding: 0 !important; overflow: hidden; }
+.m12-bar { display: flex; align-items: center; gap: 0; background: #1f1f2a; padding: 6px 8px; border-bottom: 1px solid #2a2a35; }
+.m12-bar .ico { width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: 6px; font-size: 14px; cursor: pointer; }
+.m12-bar .ico.act { background: #10b981; }
+.m12-bar .ico.warn { color: #fbbf24; }
+.m12-bar .spacer { flex: 1; }
+.m12-bar .name { font-size: 11px; color: #9ca3af; font-family: var(--font-mono); }
+.m12-body { padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
+.m12-body .row { display: flex; justify-content: space-between; align-items: center; font-size: 11px; }
+.m12-body .label { color: #6b7280; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; }
+.m12-body .val { color: #e5e7eb; }
+.m12-body .slider { width: 100%; height: 3px; background: #2a2a35; border-radius: 2px; position: relative; }
+.m12-body .slider::after { content:''; position:absolute; left:0; top:0; bottom:0; width:70%; background: #10b981; border-radius: 2px; }
+.m12-body .kbd { background: #2a2a35; color: #e5e7eb; padding: 1px 6px; border-radius: 3px; font-family: var(--font-mono); font-size: 10px; border-bottom: 2px solid #1a1a23; }
+.m12-spkr { display: flex; align-items: center; gap: 6px; padding: 4px 6px; background: #1f1f2a; border-radius: 4px; font-size: 10px; }
+.m12-spkr .lvl { display: flex; gap: 1px; }
+.m12-spkr .lvl span { width: 2px; height: 8px; background: #10b981; border-radius: 1px; }
+.m12-spkr .lvl span:nth-child(n+3) { opacity: 0.3; }
+</style>
+
+<div class="gallery">
+
+<!-- 1. DARK GLASS -->
+<div class="tile">
+  <div class="tile-label"><span>Dark glassmorphism</span><span class="tile-num">01</span></div>
+  <div class="mock m1">
+    <div class="head">
+      <span class="title">l2voice</span>
+      <span class="muted"><span class="dot"></span>connected</span>
+    </div>
+    <div class="row"><span class="muted">session</span><span class="chip">sid 5</span></div>
+    <div>
+      <div class="row" style="padding-bottom:4px"><span class="muted">master volume</span><span>70%</span></div>
+      <div class="slider"></div>
+    </div>
+    <div class="row"><span><span class="check on"></span>require window focus</span></div>
+    <div class="row"><span><span class="check"></span>always on (no PTT)</span></div>
+    <div class="row"><span class="muted">push-to-talk</span><span class="chip">H</span></div>
+    <div class="row" style="padding-top:4px; border-top:1px solid rgba(255,255,255,0.06);"><span class="muted">speakers</span><span class="muted">0 active</span></div>
+  </div>
+</div>
+
+<!-- 2. CYBERPUNK -->
+<div class="tile">
+  <div class="tile-label"><span>Cyberpunk neon</span><span class="tile-num">02</span></div>
+  <div class="mock m2">
+    <div class="head">// L2<span>::</span>VOICE //</div>
+    <div class="row"><span class="label">LINK</span><span class="val">◉ ONLINE · 0x05</span></div>
+    <div class="row"><span class="label">PLAYER</span><span class="val">268499103</span></div>
+    <div class="row" style="padding-top:4px;"><span class="label">GAIN</span><span class="val">1.00</span></div>
+    <div class="bar"></div>
+    <div class="row"><span class="label">// focus_lock</span><span class="val">[ ON ]</span></div>
+    <div class="row"><span class="label">// always_tx</span><span class="val">[OFF]</span></div>
+    <div class="row"><span class="label">PTT_BIND</span><span><span class="key">H</span> <button class="btn">REBIND</button></span></div>
+    <div class="row" style="opacity:0.6;"><span class="label">CHANNELS</span><span class="val">[0/8]</span></div>
+  </div>
+</div>
+
+<!-- 3. L2 GOTHIC -->
+<div class="tile">
+  <div class="tile-label"><span>L2 gothic (recomendado)</span><span class="tile-num">03</span></div>
+  <div class="mock m3">
+    <div class="head">VOX AETERNUM</div>
+    <div class="row"><span class="label">channel</span><span class="val">⚔ connected</span></div>
+    <div class="row"><span class="label">soul id</span><span class="val">05 · 268499103</span></div>
+    <div class="row" style="padding-top:4px;"><span class="label">master volume</span><span class="val">1.00</span></div>
+    <div class="bar"></div>
+    <div class="row"><span><span class="check on"></span><span class="label">require window focus</span></span></div>
+    <div class="row"><span><span class="check"></span><span class="label">always speak</span></span></div>
+    <div class="row"><span class="label">speak key</span><span class="val">「 H 」 <button class="btn">rebind</button></span></div>
+    <div class="row" style="border-top:1px solid #5a4410; padding-top:6px;"><span class="label">listeners</span><span class="val">none yet</span></div>
+  </div>
+</div>
+
+<!-- 4. PARCHMENT -->
+<div class="tile">
+  <div class="tile-label"><span>Medieval parchment</span><span class="tile-num">04</span></div>
+  <div class="mock m4">
+    <div class="head">Voice Scroll</div>
+    <div class="row"><span class="label">aetheric link</span><span class="val">✦ bound</span></div>
+    <div class="row"><span class="label">summoner</span><span class="val">№ 268499103</span></div>
+    <div class="row" style="padding-top:4px;"><span class="label">voice strength</span><span class="val">I.00</span></div>
+    <div class="bar"></div>
+    <div class="row"><span><span class="check on"></span><span class="label">focus required</span></span></div>
+    <div class="row"><span><span class="check"></span><span class="label">ever-speaking</span></span></div>
+    <div class="row"><span class="label">incantation key</span><span class="val">H <button class="btn">change</button></span></div>
+    <div class="row" style="border-top:1px solid #c4a878; padding-top:6px; font-style: italic;"><span class="label">no listeners present</span></div>
+  </div>
+</div>
+
+<!-- 5. MINIMAL PILL -->
+<div class="tile">
+  <div class="tile-label"><span>Floating pill + dock</span><span class="tile-num">05</span></div>
+  <div class="mock m5-wrap" style="background:#0f0f14;">
+    <div class="m5">
+      <div class="pill-status"><span class="pill-dot"></span><span style="color:#aaa;">l2voice</span></div>
+      <div class="vol-mini"></div>
+      <span class="ptt">H</span>
+      <div class="icon-btn active">🎤</div>
+      <div class="icon-btn" style="font-size:11px;">⚙</div>
+    </div>
+    <div class="m5-expanded">
+      <div class="erow"><span>session</span><span>sid 5 · 268499103</span></div>
+      <div class="erow"><span>require focus</span><span style="color:#4ade80;">on</span></div>
+      <div class="erow"><span>always on</span><span style="color:#666;">off</span></div>
+      <div class="erow"><span>speakers</span><span>0 active</span></div>
+    </div>
+    <div class="m5-hint">double-click pill to expand · Insert to hide</div>
+  </div>
+</div>
+
+<!-- 6. DISCORD STYLE -->
+<div class="tile">
+  <div class="tile-label"><span>Discord-inspired</span><span class="tile-num">06</span></div>
+  <div class="mock m6">
+    <div class="head">
+      <div><div class="title">l2voice</div><div style="font-size:10px; color:#80848e;">sid 5 · 268499103</div></div>
+      <span class="badge">CONNECTED</span>
+    </div>
+    <div>
+      <div class="row"><span class="label">Master volume</span><span class="val">100%</span></div>
+      <div class="slider" style="margin-top:6px;"></div>
+    </div>
+    <div class="row"><span class="label">Require window focus</span><div class="toggle on"></div></div>
+    <div class="row"><span class="label">Always on (no PTT)</span><div class="toggle"></div></div>
+    <div class="row"><span class="label">Push-to-talk</span><span><span class="kbd">H</span> <button class="btn">Rebind</button></span></div>
+    <div class="row" style="border-top:1px solid #1e1f22; padding-top:6px;"><span class="label">Speakers</span><span class="val">0 active</span></div>
+  </div>
+</div>
+
+<!-- 7. SCI-FI HUD -->
+<div class="tile">
+  <div class="tile-label"><span>Sci-fi HUD</span><span class="tile-num">07</span></div>
+  <div class="mock m7">
+    <div class="head"><span>◤ L2.VOX</span><span><span class="pulse"></span></span></div>
+    <div class="row"><span class="label">STATUS</span><span class="val">ONLINE</span></div>
+    <div class="row"><span class="label">SID</span><span class="val">05</span></div>
+    <div class="row"><span class="label">UID</span><span class="val">268499103</span></div>
+    <div class="row" style="padding-top:4px;"><span class="label">GAIN</span><div class="blocks"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div></div>
+    <div class="row"><span class="label">FOCUS_LOCK</span><span class="val">▮ ACTIVE</span></div>
+    <div class="row"><span class="label">AUTO_TX</span><span class="val">▯ INACTIVE</span></div>
+    <div class="row"><span class="label">PTT</span><span class="val">[H] BIND</span></div>
+  </div>
+</div>
+
+<!-- 8. RETRO TERMINAL -->
+<div class="tile">
+  <div class="tile-label"><span>Retro CRT terminal</span><span class="tile-num">08</span></div>
+  <div class="mock m8">
+    <div class="head">l2voice.sh --status</div>
+    <div class="row"><span class="label">ws</span><span class="val">connected</span></div>
+    <div class="row"><span class="label">sid</span><span class="val">5</span></div>
+    <div class="row"><span class="label">pid</span><span class="val">268499103</span></div>
+    <div class="row" style="padding-top:4px;"><span class="label">vol</span><span class="ascii-bar">[██████████──] 1.00</span></div>
+    <div class="row"><span class="label">focus</span><span class="val">[x] on</span></div>
+    <div class="row"><span class="label">always</span><span class="val">[ ] off</span></div>
+    <div class="row"><span class="label">ptt</span><span class="val">vk=72 (H)</span></div>
+    <div style="font-size:11px; padding-top:4px;">$ <span class="blink">_</span></div>
+  </div>
+</div>
+
+<!-- 9. MATERIAL DARK -->
+<div class="tile">
+  <div class="tile-label"><span>Material dark</span><span class="tile-num">09</span></div>
+  <div class="mock m9">
+    <div class="head">
+      <div class="icon">🎙</div>
+      <div><div class="title">Voice chat</div><div class="sub">sid 5 · player 268499103</div></div>
+    </div>
+    <div class="card">
+      <div class="row"><span class="label">Master volume</span><span class="val">100%</span></div>
+      <div class="slider"></div>
+    </div>
+    <div class="card">
+      <div class="row"><span class="label">Require window focus</span><div class="toggle on"></div></div>
+      <div class="row" style="padding-top:4px;"><span class="label">Always on (no PTT)</span><div class="toggle"></div></div>
+    </div>
+    <div class="row"><span class="label">PTT key</span><span class="val">H</span></div>
+  </div>
+</div>
+
+<!-- 10. RGB GAMING -->
+<div class="tile">
+  <div class="tile-label"><span>RGB gaming</span><span class="tile-num">10</span></div>
+  <div class="mock m10">
+    <div class="head"><span class="title">L2VOICE</span><span class="chip">● LIVE</span></div>
+    <div class="row"><span class="label">SESSION</span><span class="val">05 · 268499103</span></div>
+    <div class="row" style="padding-top:4px;"><span class="label">MASTER</span><span class="val">1.00</span></div>
+    <div class="slider"></div>
+    <div class="row"><span class="label">FOCUS LOCK</span><span class="val" style="color:#10b981;">● ON</span></div>
+    <div class="row"><span class="label">ALWAYS ON</span><span class="val" style="color:#666;">○ OFF</span></div>
+    <div class="row"><span class="label">PTT KEY</span><span><span class="key">H</span></span></div>
+    <div class="row" style="border-top:1px solid #ffffff10; padding-top:6px;"><span class="label">SPEAKERS</span><span class="val">0 / 8</span></div>
+  </div>
+</div>
+
+<!-- 11. ARCANE -->
+<div class="tile">
+  <div class="tile-label"><span>Arcane mystical</span><span class="tile-num">11</span></div>
+  <div class="mock m11">
+    <div class="head">⟡ whisper circle ⟡</div>
+    <div class="row"><span class="label">attunement</span><span class="val">bound · sid v</span></div>
+    <div class="row"><span class="label">soul mark</span><span class="val">268499103</span></div>
+    <div class="row" style="padding-top:4px;"><span class="label">resonance</span><span class="val">1.00</span></div>
+    <div class="bar"></div>
+    <div class="row"><span><span class="rune">⚝</span><span class="label">require focus</span></span></div>
+    <div class="row"><span><span class="rune">○</span><span class="label">unceasing voice</span></span></div>
+    <div class="row"><span class="label">channeling rune</span><span class="val">⟨ H ⟩ <button class="btn">rebind</button></span></div>
+  </div>
+</div>
+
+<!-- 12. COMPACT ICON -->
+<div class="tile">
+  <div class="tile-label"><span>Compact icon-driven</span><span class="tile-num">12</span></div>
+  <div class="mock m12">
+    <div class="m12-bar">
+      <div class="ico act">🎤</div>
+      <div class="ico">🔊</div>
+      <div class="ico warn">⚡</div>
+      <div class="spacer"></div>
+      <span class="name">l2voice ● 5</span>
+      <div class="ico">⚙</div>
+    </div>
+    <div class="m12-body">
+      <div class="row"><span class="label">Volume</span><span class="val">100</span></div>
+      <div class="slider"></div>
+      <div class="row"><span class="label">PTT</span><span class="kbd">H</span></div>
+      <div class="row"><span class="label">Focus required</span><span class="val" style="color:#10b981;">●</span></div>
+      <div style="border-top:1px solid #2a2a35; padding-top:6px;">
+        <div class="m12-spkr">
+          <span style="color:#10b981;">●</span>
+          <span>sid 7</span>
+          <div class="lvl"><span></span><span></span><span></span><span></span><span></span></div>
+          <span style="margin-left:auto; color:#6b7280;">1.00</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+</div>

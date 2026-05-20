@@ -186,6 +186,13 @@ struct VoiceNetwork::Impl {
                 case ix::WebSocketMessageType::Error:
                     connected.store(false);
                     auth_sent.store(false);
+                    // Clear the auth state so the overlay hides until
+                    // the next auth_ok arrives. Without this, going
+                    // from in-world back to char-select would leave
+                    // the panel visible during login.
+                    session_id.store(0);
+                    player_id_resolved.store(0);
+                    udp_port.store(0);
                     break;
                 case ix::WebSocketMessageType::Message:
                     HandleWsMessage(msg->str);
