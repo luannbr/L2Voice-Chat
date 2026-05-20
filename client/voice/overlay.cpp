@@ -1,26 +1,20 @@
 // overlay.cpp — D3D9 EndScene hook + Dear ImGui in-game panel.
 //
-// Hooking approach (well-known "dummy device" trick):
-//   1. Create a throwaway IDirect3DDevice9 against the desktop HWND.
-//   2. Read the vtable entry at index 42 (EndScene) and 16 (Reset).
-//   3. Both are SHARED across all devices created by the same D3D9
-//      DLL, so hooking those vtable slots intercepts EndScene on
-//      L2's real device once it comes up.
-//   4. Release the dummy device — only the function addresses are
-//      needed.
-//
-// MinHook detours those addresses to our handlers. On first call we
-// initialize ImGui's DX9 + Win32 backends using the real device's
-// presentation parameters.
-//
-// Input: SetWindowLongPtrW(GWLP_WNDPROC) swap to capture mouse/kb,
-// chaining to ImGui_ImplWin32_WndProcHandler before passing to the
-// game. Mouse/keyboard events ImGui wants are CONSUMED (don't leak
-// to the game). WM_SETCURSOR is suppressed while ImGui has the
-// mouse so the game's custom cursor doesn't fight the panel's.
+// Hooks (per the dummy-device vtable trick):
+//   - IDirect3DDevice9::EndScene  → ImGui frame
+//   - IDirect3DDevice9::Reset     → ImGui device-objects invalidation
+// Input routing:
+//   - WndProc swap chains ImGui's input handler. Mouse / keyboard
+//     messages ImGui wants are CONSUMED (don't leak to the game).
+//   - WM_SETCURSOR is suppressed while ImGui has the mouse so the
+//     game's custom cursor doesn't fight the panel's.
+//   - A WH_MOUSE_LL low-level hook blocks mouse events at the OS
+//     level when the cursor is over our window AND ImGui wants the
+//     mouse — this catches DirectInput-based games (L2 included)
+//     that bypass the regular WndProc path.
 
 #include "overlay.h"
-#include "audio_io.h"     // SpeakerInfo
+#include "audio_io.h"
 #include "voice.h"
 
 #include <windows.h>
@@ -49,10 +43,12 @@ EndScene_t      g_origEndScene = nullptr;
 Reset_t         g_origReset    = nullptr;
 WNDPROC         g_origWndProc  = nullptr;
 HWND            g_targetHwnd   = nullptr;
+HHOOK           g_mouseHook    = nullptr;
 ImGuiContext*   g_imguiCtx     = nullptr;
 std::atomic<bool> g_imguiBackendInit{false};
-std::atomic<bool> g_visible{true};       // Insert toggles
-std::atomic<bool> g_minimized{false};    // collapsed to a small icon
+std::atomic<bool> g_visible{true};
+std::atomic<bool> g_minimized{false};
+std::atomic<bool> g_imguiWantsMouse{false};   // sampled each frame; read by low-level hook
 int             g_toggleVk      = VK_INSERT;
 std::atomic<bool> g_captureNextKey{false};
 
@@ -96,15 +92,6 @@ void VkToString(int vk, char* out, size_t cap) {
     _snprintf_s(out, cap, _TRUNCATE, "vk=%d", vk);
 }
 
-// "Dark glassmorphism" style per the gallery design 01.
-// Colors picked off the HTML mock:
-//   bg          rgba(20,22,30,0.92)
-//   border      rgba(255,255,255,0.08)
-//   text        #e8eaf0
-//   muted text  #8b92a3
-//   accent      #818cf8  (indigo)
-//   accent-bg   #818cf8 @ 15% alpha — used for chips
-//   dot ok      #4ade80
 void ApplyDarkGlassStyle() {
     ImGuiStyle& s = ImGui::GetStyle();
     s.WindowRounding   = 8.0f;
@@ -114,6 +101,7 @@ void ApplyDarkGlassStyle() {
     s.ItemSpacing      = ImVec2(8, 6);
     s.WindowBorderSize = 1.0f;
     s.FrameBorderSize  = 0.0f;
+    s.TabRounding      = 6.0f;
 
     ImVec4 bg     = ImVec4(20/255.f, 22/255.f, 30/255.f, 0.92f);
     ImVec4 border = ImVec4(1,1,1, 0.08f);
@@ -125,6 +113,7 @@ void ApplyDarkGlassStyle() {
 
     ImVec4* c = s.Colors;
     c[ImGuiCol_WindowBg]              = bg;
+    c[ImGuiCol_ChildBg]               = ImVec4(0,0,0,0);
     c[ImGuiCol_Border]                = border;
     c[ImGuiCol_Text]                  = text;
     c[ImGuiCol_TextDisabled]          = textD;
@@ -149,17 +138,22 @@ void ApplyDarkGlassStyle() {
     c[ImGuiCol_ScrollbarBg]           = ImVec4(0,0,0,0);
     c[ImGuiCol_ScrollbarGrab]         = ImVec4(1,1,1,0.1f);
     c[ImGuiCol_ScrollbarGrabHovered]  = ImVec4(1,1,1,0.15f);
+    c[ImGuiCol_Tab]                   = ImVec4(1,1,1, 0.04f);
+    c[ImGuiCol_TabHovered]            = accentHover;
+    c[ImGuiCol_TabActive]             = accentBg;
+    c[ImGuiCol_TabUnfocused]          = ImVec4(1,1,1, 0.02f);
+    c[ImGuiCol_TabUnfocusedActive]    = accentBg;
 }
 
-// Tiny chip/badge — accent-colored rounded rectangle with text.
-void Chip(const char* text, ImVec4 color = ImVec4(129/255.f, 140/255.f, 248/255.f, 1.0f)) {
+void Chip(const char* text,
+          ImVec4 color = ImVec4(129/255.f, 140/255.f, 248/255.f, 1.0f)) {
     ImVec4 bg = color; bg.w = 0.15f;
     ImGui::PushStyleColor(ImGuiCol_Button,        bg);
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, bg);
     ImGui::PushStyleColor(ImGuiCol_ButtonActive,  bg);
     ImGui::PushStyleColor(ImGuiCol_Text,          color);
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8, 2));
-    ImGui::SmallButton(text);   // SmallButton has no callback path; just visual
+    ImGui::SmallButton(text);
     ImGui::PopStyleVar();
     ImGui::PopStyleColor(4);
 }
@@ -167,11 +161,10 @@ void Chip(const char* text, ImVec4 color = ImVec4(129/255.f, 140/255.f, 248/255.
 void DrawConnectionDot(bool ok) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 p = ImGui::GetCursorScreenPos();
-    p.y += 6;  // align with text baseline
+    p.y += 8;
     ImU32 col = ok ? IM_COL32(74, 222, 128, 255) : IM_COL32(160, 80, 80, 255);
     dl->AddCircleFilled(ImVec2(p.x + 4, p.y), 4.0f, col);
     if (ok) {
-        // soft glow
         dl->AddCircleFilled(ImVec2(p.x + 4, p.y), 7.0f,
             IM_COL32(74, 222, 128, 50));
     }
@@ -180,11 +173,11 @@ void DrawConnectionDot(bool ok) {
 }
 
 // =============================================================
-// Minimized state — small floating icon
+// Minimized state
 // =============================================================
 
 void DrawMinimized() {
-    ImGui::SetNextWindowSize(ImVec2(40, 40), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(48, 48), ImGuiCond_Always);
     ImGui::SetNextWindowBgAlpha(0.85f);
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar
                            | ImGuiWindowFlags_NoResize
@@ -194,12 +187,10 @@ void DrawMinimized() {
         ImGui::End();
         return;
     }
-    // Centered headphone glyph. Unicode would be nicer but default
-    // font doesn't ship emoji — use a stylized "(•)" or letter.
-    ImGui::SetCursorPos(ImVec2(8, 5));
+    ImGui::SetCursorPos(ImVec2(10, 10));
     ImGui::PushStyleColor(ImGuiCol_Text,
         ImVec4(129/255.f, 140/255.f, 248/255.f, 1.0f));
-    ImGui::Text("VOX");
+    ImGui::TextUnformatted("VOX");
     ImGui::PopStyleColor();
     if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         g_minimized.store(false);
@@ -208,60 +199,13 @@ void DrawMinimized() {
 }
 
 // =============================================================
-// Main panel (Design 01 — Dark Glassmorphism)
+// Tab bodies
 // =============================================================
 
-void DrawPanel() {
-    if (!g_visible.load(std::memory_order_relaxed)) return;
-
-    OverlayState st = SnapshotOverlayState();
-    // Hide entirely until past EnterWorld (session is allocated).
-    if (st.session_id == 0) return;
-
-    if (g_minimized.load()) { DrawMinimized(); return; }
-
-    ImGui::SetNextWindowSize(ImVec2(300, 360), ImGuiCond_FirstUseEver);
-    ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse
-                           | ImGuiWindowFlags_NoTitleBar;
-    if (!ImGui::Begin("##l2voice", nullptr, flags)) {
-        ImGui::End();
-        return;
-    }
-
-    // ----- Header: title / connection dot / minimize -----
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1,1,1, 1.0f));
-    ImGui::TextUnformatted("l2voice");
-    ImGui::PopStyleColor();
-    ImGui::SameLine();
-    // right-align connection chip + minimize button
-    float rightX = ImGui::GetWindowWidth() - 70;
-    ImGui::SameLine(rightX);
-    DrawConnectionDot(st.ws_connected);
-    ImGui::TextDisabled("%s", st.ws_connected ? "connected" : "offline");
-    ImGui::SameLine();
-    if (ImGui::SmallButton("_##min")) {
-        g_minimized.store(true);
-    }
-    ImGui::Separator();
-
-    // ----- Session chip row -----
-    ImGui::TextDisabled("session");
-    ImGui::SameLine(rightX);
-    char sidLabel[24];
-    _snprintf_s(sidLabel, sizeof(sidLabel), _TRUNCATE, "sid %u", st.session_id);
-    Chip(sidLabel);
-    if (st.player_id != 0) {
-        ImGui::TextDisabled("player");
-        ImGui::SameLine(rightX);
-        char pidLabel[24];
-        _snprintf_s(pidLabel, sizeof(pidLabel), _TRUNCATE, "%u", st.player_id);
-        Chip(pidLabel);
-    }
-
+void DrawProximityTab(const OverlayState& st) {
     // ----- Master volume -----
-    ImGui::Spacing();
     ImGui::TextDisabled("master volume");
-    ImGui::SameLine(rightX);
+    ImGui::SameLine(ImGui::GetWindowWidth() - 60);
     ImGui::Text("%d%%", (int)(st.master_volume * 100));
     float vol = st.master_volume;
     ImGui::PushItemWidth(-1);
@@ -270,8 +214,9 @@ void DrawPanel() {
     }
     ImGui::PopItemWidth();
 
-    // ----- Toggles -----
     ImGui::Spacing();
+
+    // ----- Toggles -----
     bool focus = st.require_focus;
     if (ImGui::Checkbox("require window focus", &focus)) {
         SetRequireFocus(focus);
@@ -281,10 +226,11 @@ void DrawPanel() {
         SetAlwaysOn(on);
     }
 
-    // ----- PTT -----
     ImGui::Spacing();
-    ImGui::TextDisabled("push-to-talk");
-    ImGui::SameLine(rightX - 40);
+
+    // ----- PTT -----
+    ImGui::TextUnformatted("push-to-talk");
+    ImGui::SameLine();
     bool capturing = g_captureNextKey.load();
     if (capturing) {
         ImGui::PushStyleColor(ImGuiCol_Text,
@@ -294,25 +240,38 @@ void DrawPanel() {
     } else {
         char vkLabel[32];
         VkToString(st.ptt_proximity_vk, vkLabel, sizeof(vkLabel));
+        ImGui::SameLine(ImGui::GetWindowWidth() - 120);
         Chip(vkLabel);
         ImGui::SameLine();
         if (ImGui::SmallButton("rebind")) {
             g_captureNextKey.store(true);
         }
     }
+
     ImGui::Spacing();
     ImGui::Separator();
 
-    // ----- Speakers -----
+    // ----- Speakers + mute-all -----
     ImGui::TextDisabled("speakers");
-    ImGui::SameLine(rightX);
-    ImGui::TextDisabled("%d active", st.active_speakers);
-
-    SpeakerInfo infos[16];
+    ImGui::SameLine();
+    ImGui::TextDisabled("(%d active)", st.active_speakers);
+    ImGui::SameLine(ImGui::GetWindowWidth() - 90);
+    SpeakerInfo infos[64];
     size_t n = 0;
-    GetSpeakerList(infos, 16, n);
+    GetSpeakerList(infos, 64, n);
+    // Detect whether ANY speaker is currently un-muted, to choose
+    // between "mute all" and "unmute all".
+    bool anyUnmuted = false;
+    for (size_t i = 0; i < n; ++i) if (!infos[i].muted) { anyUnmuted = true; break; }
+    if (ImGui::SmallButton(anyUnmuted ? "mute all" : "unmute all")) {
+        for (size_t i = 0; i < n; ++i) {
+            SetSpeakerMuted(infos[i].src_id, anyUnmuted);
+        }
+    }
+
+    ImGui::BeginChild("##speakers", ImVec2(0, 120), false,
+        ImGuiWindowFlags_HorizontalScrollbar);
     if (n == 0) {
-        ImGui::Spacing();
         ImGui::TextDisabled("  (no one nearby)");
     }
     for (size_t i = 0; i < n; ++i) {
@@ -324,7 +283,7 @@ void DrawPanel() {
         ImGui::SameLine();
         bool speaking = infos[i].ms_since_mix < 200;
         ImVec4 col = speaking ? ImVec4(74/255.f, 222/255.f, 128/255.f, 1.0f)
-                              : ImVec4(139/255.f, 146/255.f, 163/255.f, 1.0f);
+                              : ImVec4(232/255.f, 234/255.f, 240/255.f, 1.0f);
         char name[48];
         bool haveName = GetSpeakerName(infos[i].src_id, name, sizeof(name));
         ImGui::PushStyleColor(ImGuiCol_Text, col);
@@ -343,42 +302,180 @@ void DrawPanel() {
         }
         ImGui::PopID();
     }
+    ImGui::EndChild();
+}
+
+void DrawComingSoon(const char* channelName) {
+    ImGui::Spacing();
+    ImGui::Spacing();
+    ImGui::PushStyleColor(ImGuiCol_Text,
+        ImVec4(139/255.f, 146/255.f, 163/255.f, 1.0f));
+    ImGui::TextWrapped(
+        "%s channel not yet implemented.\n\n"
+        "Phase 5 will add group voice (members of your %s only, no "
+        "spatial attenuation). For now use proximity.", channelName, channelName);
+    ImGui::PopStyleColor();
+}
+
+// =============================================================
+// Main panel
+// =============================================================
+
+void DrawPanel() {
+    if (!g_visible.load(std::memory_order_relaxed)) return;
+
+    OverlayState st = SnapshotOverlayState();
+    if (st.session_id == 0) {
+        g_imguiWantsMouse.store(false);
+        return;
+    }
+
+    if (g_minimized.load()) {
+        DrawMinimized();
+        g_imguiWantsMouse.store(ImGui::GetIO().WantCaptureMouse);
+        return;
+    }
+
+    ImGui::SetNextWindowSize(ImVec2(320, 430), ImGuiCond_FirstUseEver);
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse
+                           | ImGuiWindowFlags_NoTitleBar;
+    if (!ImGui::Begin("##l2voice", nullptr, flags)) {
+        ImGui::End();
+        g_imguiWantsMouse.store(false);
+        return;
+    }
+
+    // ====== Header (3-column layout: title | spacer | controls) ======
+    // Render controls right-to-left from the window's right edge so
+    // the minimize button is always visible regardless of text width.
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1,1,1, 1.0f));
+    ImGui::TextUnformatted("l2voice");
+    ImGui::PopStyleColor();
+
+    // Right-anchor block: [ minimize ] [ status ] [ dot ]
+    const char* statusText = st.ws_connected ? "connected" : "offline";
+    float minBtnW    = ImGui::CalcTextSize("_").x  + 18.0f;
+    float statusW    = ImGui::CalcTextSize(statusText).x + 6.0f;
+    float dotW       = 14.0f;
+    float headerW    = minBtnW + statusW + dotW + 12.0f;
+    ImGui::SameLine(ImGui::GetWindowWidth() - headerW - 8.0f);
+    DrawConnectionDot(st.ws_connected);
+    ImGui::TextDisabled("%s", statusText);
+    ImGui::SameLine();
+    if (ImGui::SmallButton("_##min")) g_minimized.store(true);
+    ImGui::Separator();
+
+    // ====== Session + player name (header info area) ======
+    // For "player" we show the CHARACTER NAME, queried via the same
+    // sid → name machinery used for other speakers. Looking up our
+    // own session id resolves to our own player on the server side.
+    ImGui::TextDisabled("session");
+    ImGui::SameLine(ImGui::GetWindowWidth() - 72);
+    char sidLabel[24];
+    _snprintf_s(sidLabel, sizeof(sidLabel), _TRUNCATE, "sid %u", st.session_id);
+    Chip(sidLabel);
+
+    ImGui::TextDisabled("player");
+    ImGui::SameLine(ImGui::GetWindowWidth() - 130);
+    char myName[48];
+    bool haveMyName = GetSpeakerName(st.session_id, myName, sizeof(myName));
+    if (haveMyName && myName[0]) {
+        Chip(myName);
+    } else if (st.player_id != 0) {
+        char pid[16];
+        _snprintf_s(pid, sizeof(pid), _TRUNCATE, "%u", st.player_id);
+        Chip(pid);
+    } else {
+        ImGui::TextDisabled("?");
+    }
+    ImGui::Separator();
+
+    // ====== Tabs ======
+    if (ImGui::BeginTabBar("##chs")) {
+        if (ImGui::BeginTabItem("Proximity")) {
+            DrawProximityTab(st);
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Party")) {
+            DrawComingSoon("Party");
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Clan")) {
+            DrawComingSoon("Clan");
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Ally")) {
+            DrawComingSoon("Ally");
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
 
     ImGui::Separator();
-    ImGui::TextDisabled("Insert to hide  ·  click _ to minimize");
+    ImGui::TextDisabled("Insert to hide  ·  _ to minimize");
+
+    // Snapshot WantCaptureMouse for the low-level hook (read on
+    // another thread without grabbing the ImGui context).
+    g_imguiWantsMouse.store(ImGui::GetIO().WantCaptureMouse);
+
     ImGui::End();
 }
 
 // =============================================================
-// WndProc — input routing
+// Low-level mouse hook: blocks mouse input from reaching L2 (via
+// DirectInput etc.) when ImGui is the intended consumer.
+// =============================================================
+
+LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wp, LPARAM lp) {
+    if (nCode != HC_ACTION) return CallNextHookEx(nullptr, nCode, wp, lp);
+    if (!g_imguiBackendInit.load() || !g_imguiWantsMouse.load()) {
+        return CallNextHookEx(nullptr, nCode, wp, lp);
+    }
+    // Only block when the cursor is over the L2 window and the panel
+    // is the intended target. We let mouse movement through so the
+    // OS cursor still follows, but suppress button presses.
+    if (wp == WM_LBUTTONDOWN || wp == WM_LBUTTONUP ||
+        wp == WM_RBUTTONDOWN || wp == WM_RBUTTONUP ||
+        wp == WM_MBUTTONDOWN || wp == WM_MBUTTONUP ||
+        wp == WM_XBUTTONDOWN || wp == WM_XBUTTONUP ||
+        wp == WM_MOUSEWHEEL  || wp == WM_MOUSEHWHEEL) {
+        POINT pt;
+        if (GetCursorPos(&pt)) {
+            HWND under = WindowFromPoint(pt);
+            DWORD ownerPid = 0;
+            if (under) GetWindowThreadProcessId(under, &ownerPid);
+            if (ownerPid == GetCurrentProcessId()) {
+                return 1;   // swallow — game (DirectInput too) won't see it
+            }
+        }
+    }
+    return CallNextHookEx(nullptr, nCode, wp, lp);
+}
+
+// =============================================================
+// WndProc
 // =============================================================
 
 LRESULT CALLBACK HookedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    // 1) Show/hide hotkey, before ImGui sees it.
     if (msg == WM_KEYDOWN && (int)wp == g_toggleVk) {
         bool prev = g_visible.exchange(!g_visible.load());
         Logf("[l2voice] overlay toggled %s\n", prev ? "OFF" : "ON");
         return 0;
     }
-
-    // 2) PTT rebind capture (keyboard + mouse buttons except LMB).
     if (g_captureNextKey.load()) {
         int capturedVk = 0;
         bool cancel = false;
         if (msg == WM_KEYDOWN) {
             int vk = (int)wp;
-            if (vk == VK_ESCAPE) { cancel = true; }
+            if (vk == VK_ESCAPE) cancel = true;
             else if (vk != VK_SHIFT && vk != VK_CONTROL && vk != VK_MENU &&
                      vk != VK_LSHIFT && vk != VK_RSHIFT &&
                      vk != VK_LCONTROL && vk != VK_RCONTROL &&
-                     vk != VK_LMENU && vk != VK_RMENU) {
-                capturedVk = vk;
-            }
+                     vk != VK_LMENU && vk != VK_RMENU) capturedVk = vk;
         } else if (msg == WM_RBUTTONDOWN) capturedVk = VK_RBUTTON;
         else if (msg == WM_MBUTTONDOWN)  capturedVk = VK_MBUTTON;
-        else if (msg == WM_XBUTTONDOWN) {
+        else if (msg == WM_XBUTTONDOWN)
             capturedVk = (HIWORD(wp) == XBUTTON1) ? VK_XBUTTON1 : VK_XBUTTON2;
-        }
         if (cancel) { g_captureNextKey.store(false); return 0; }
         if (capturedVk != 0) {
             g_captureNextKey.store(false);
@@ -393,29 +490,24 @@ LRESULT CALLBACK HookedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         ImGui_ImplWin32_WndProcHandler(hwnd, msg, wp, lp);
         ImGuiIO& io = ImGui::GetIO();
 
-        // 3) Suppress the game's WM_SETCURSOR while ImGui has the mouse
-        //    — otherwise the game's custom cursor fights the panel's
-        //    and the cursor flickers.
         if (msg == WM_SETCURSOR && io.WantCaptureMouse) {
             ::SetCursor(::LoadCursorA(nullptr, IDC_ARROW));
             return TRUE;
         }
 
-        // 4) Consume mouse / keyboard messages when ImGui wants them,
-        //    so clicks on the panel don't pass through to the game.
         bool isMouse = (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST) ||
                        msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL;
         bool isKey   = (msg == WM_KEYDOWN || msg == WM_KEYUP ||
                         msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP ||
                         msg == WM_CHAR);
-        if (isMouse && io.WantCaptureMouse)       return 0;
-        if (isKey   && io.WantCaptureKeyboard)    return 0;
+        if (isMouse && io.WantCaptureMouse)    return 0;
+        if (isKey   && io.WantCaptureKeyboard) return 0;
     }
     return CallWindowProcW(g_origWndProc, hwnd, msg, wp, lp);
 }
 
 // =============================================================
-// D3D9 hook
+// D3D9 hooks
 // =============================================================
 
 HRESULT WINAPI HookEndScene(IDirect3DDevice9* dev) {
@@ -439,8 +531,6 @@ HRESULT WINAPI HookEndScene(IDirect3DDevice9* dev) {
 
         ImGuiIO& io = ImGui::GetIO();
         io.IniFilename = nullptr;
-        // Tell ImGui to NOT manage the OS cursor — the game owns it.
-        // WM_SETCURSOR suppression in WndProc handles UI areas.
         io.BackendFlags &= ~ImGuiBackendFlags_HasMouseCursors;
 
         ApplyDarkGlassStyle();
@@ -448,6 +538,23 @@ HRESULT WINAPI HookEndScene(IDirect3DDevice9* dev) {
         g_origWndProc = reinterpret_cast<WNDPROC>(
             SetWindowLongPtrW(hwnd, GWLP_WNDPROC,
                               reinterpret_cast<LONG_PTR>(&HookedWndProc)));
+
+        // Install the low-level mouse hook now that we know we're
+        // in-process and have a context. WH_MOUSE_LL is per-thread when
+        // hMod is NULL and ThreadId is 0; but it's global with a
+        // non-null hMod. We use ourselves so the callback lives in our
+        // module's address space — required for LL hooks.
+        HMODULE self = nullptr;
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCSTR>(&HookedWndProc), &self);
+        g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, &LowLevelMouseProc,
+            self, 0);
+        if (!g_mouseHook) {
+            Logf("[l2voice] overlay: WH_MOUSE_LL install failed (err=%lu)\n",
+                GetLastError());
+        }
+
         g_imguiBackendInit.store(true);
     }
 
@@ -495,10 +602,7 @@ bool GetDeviceVTableEntries(void*& endSceneOut, void*& resetOut) {
     HRESULT hr = d3d->CreateDevice(
         D3DADAPTER_DEFAULT, D3DDEVTYPE_NULLREF, GetDesktopWindow(),
         D3DCREATE_SOFTWARE_VERTEXPROCESSING, &pp, &dev);
-    if (FAILED(hr) || !dev) {
-        d3d->Release();
-        return false;
-    }
+    if (FAILED(hr) || !dev) { d3d->Release(); return false; }
     void** vt = *reinterpret_cast<void***>(dev);
     resetOut    = vt[16];
     endSceneOut = vt[42];
@@ -544,6 +648,7 @@ bool InstallOverlay() {
 }
 
 void UninstallOverlay() {
+    if (g_mouseHook) { UnhookWindowsHookEx(g_mouseHook); g_mouseHook = nullptr; }
     if (g_imguiBackendInit.load()) {
         ImGui::SetCurrentContext(g_imguiCtx);
         ImGui_ImplDX9_Shutdown();
