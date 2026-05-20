@@ -102,52 +102,62 @@ func handleWS(ctx context.Context, w http.ResponseWriter, r *http.Request, state
 	defer conn.Close()
 	log.Printf("control: %s connected (UA=%q)", r.RemoteAddr, r.Header.Get("User-Agent"))
 
-	// Read auth as the first message. The deadline is generous —
-	// the DLL connects on L2.exe startup and only knows enough to
-	// auth once the user has clicked through to in-world (the
-	// GS TCP socket appears in the process's port table). That can
-	// take a couple of minutes if the player lingers at character
-	// selection. Don't tear down the WS in that window or
-	// IXWebSocket reconnects with exponential backoff and ends up
-	// in a 10–30 s "first-audio" delay after entering the world.
-	conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
-	_, raw, err := conn.ReadMessage()
-	if err != nil {
-		log.Printf("control: %s read auth failed: %v", r.RemoteAddr, err)
-		return
-	}
-	var msg authMsg
-	if err := json.Unmarshal(raw, &msg); err != nil || msg.Type != "auth" {
-		_ = conn.WriteJSON(authFail{Type: "auth_fail", Reason: "bad_auth_msg"})
-		return
-	}
-
-	if len(msg.Ports) == 0 {
-		_ = conn.WriteJSON(authFail{Type: "auth_fail", Reason: "no_ports"})
-		return
-	}
-
-	// Extract client IP from the WS connection's remote addr.
+	// Read auth messages until one resolves to a real player_id. The
+	// DLL connects to the WS the moment l2voice.dll loads and starts
+	// sending auth messages immediately, but it only carries the
+	// L2-to-GS source port once the user has clicked "Enter World"
+	// and the GS socket appears in the process's TCP table. Until
+	// then `/voice/whoami` returns 0. We don't close the WS on those
+	// early rejects — that would force IXWebSocket into a multi-
+	// second reconnect cycle and make first-audio-after-EnterWorld
+	// feel laggy. Instead, we reply auth_pending and wait for the
+	// next auth message (the DLL re-sends whenever its port list
+	// changes).
 	clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
-	log.Printf("control: %s auth ports=%v clientIP=%q", r.RemoteAddr, msg.Ports, clientIP)
-
-	// Resolve identity server-side via /voice/whoami.
-	playerID, err := whoamiLookup(clientIP, msg.Ports)
-	if err != nil {
-		log.Printf("control: /voice/whoami error for %s: %v", r.RemoteAddr, err)
-		_ = conn.WriteJSON(authFail{Type: "auth_fail", Reason: "whoami_error"})
-		return
-	}
-	if playerID == 0 {
-		log.Printf("control: %s rejected — no matching online player (ports=%v)",
-			r.RemoteAddr, msg.Ports)
-		_ = conn.WriteJSON(authFail{Type: "auth_fail", Reason: "player_not_resolved"})
-		return
+	authDeadline := time.Now().Add(5 * time.Minute)
+	var playerID uint32
+	for {
+		if time.Now().After(authDeadline) {
+			log.Printf("control: %s auth window exhausted (no player resolved in 5min)", r.RemoteAddr)
+			_ = conn.WriteJSON(authFail{Type: "auth_fail", Reason: "auth_timeout"})
+			return
+		}
+		conn.SetReadDeadline(authDeadline)
+		_, raw, err := conn.ReadMessage()
+		if err != nil {
+			log.Printf("control: %s read auth failed: %v", r.RemoteAddr, err)
+			return
+		}
+		var msg authMsg
+		if err := json.Unmarshal(raw, &msg); err != nil || msg.Type != "auth" {
+			_ = conn.WriteJSON(authFail{Type: "auth_fail", Reason: "bad_auth_msg"})
+			continue
+		}
+		if len(msg.Ports) == 0 {
+			_ = conn.WriteJSON(authFail{Type: "auth_pending", Reason: "no_ports_yet"})
+			continue
+		}
+		pid, lookupErr := whoamiLookup(clientIP, msg.Ports)
+		if lookupErr != nil {
+			log.Printf("control: /voice/whoami error for %s: %v", r.RemoteAddr, lookupErr)
+			_ = conn.WriteJSON(authFail{Type: "auth_pending", Reason: "whoami_error"})
+			continue
+		}
+		if pid == 0 {
+			// Probably the DLL is up but the user hasn't clicked into
+			// the world yet. Reply auth_pending and keep waiting for
+			// the next auth msg from the DLL.
+			log.Printf("control: %s auth pending — ports=%v unresolved", r.RemoteAddr, msg.Ports)
+			_ = conn.WriteJSON(authFail{Type: "auth_pending", Reason: "player_not_in_world"})
+			continue
+		}
+		playerID = pid
+		log.Printf("control: %s auth resolved player=%d (ports=%v)", r.RemoteAddr, playerID, msg.Ports)
+		break
 	}
 
 	sess := state.AllocSession(playerID)
 	defer state.Drop(sess.ID)
-	msg.Ports = nil   // hint to GC; not needed beyond this point
 
 	udpEndpoint := udpEndpointFor(r)
 	if err := conn.WriteJSON(authOk{
@@ -158,8 +168,8 @@ func handleWS(ctx context.Context, w http.ResponseWriter, r *http.Request, state
 	}); err != nil {
 		return
 	}
-	log.Printf("control: %s authed as session=%d player=%d (client=%s)",
-		r.RemoteAddr, sess.ID, playerID, msg.ClientVersion)
+	log.Printf("control: %s authed as session=%d player=%d",
+		r.RemoteAddr, sess.ID, playerID)
 
 	// Clear read deadline; rely on websocket ping/pong + topology
 	// timeout for liveness checks.

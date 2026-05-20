@@ -281,12 +281,25 @@ void VoiceNetwork::Stop() {
 }
 
 void VoiceNetwork::SetClientPorts(const uint16_t* ports, size_t count) {
+    bool changed = false;
     {
         std::lock_guard<std::mutex> lk(impl_->auth_mu);
-        impl_->client_ports.assign(ports, ports + count);
-        impl_->auth_sent.store(false);
+        if (impl_->client_ports.size() != count) {
+            changed = true;
+        } else {
+            for (size_t i = 0; i < count; ++i) {
+                if (impl_->client_ports[i] != ports[i]) {
+                    changed = true;
+                    break;
+                }
+            }
+        }
+        if (changed) {
+            impl_->client_ports.assign(ports, ports + count);
+            impl_->auth_sent.store(false);
+        }
     }
-    impl_->TrySendAuth();
+    if (changed) impl_->TrySendAuth();
 }
 
 void VoiceNetwork::SendProximityFrame(uint16_t seq,
