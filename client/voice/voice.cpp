@@ -82,17 +82,18 @@ void OnCaptureFrame(const int16_t* pcm, uint32_t samples) {
 
     bool focused = !g_mod.cfg.require_focus || L2HasForegroundFocus();
 
-    // Channel priority on multi-PTT-held: ally > clan > party > proximity.
-    // always_on only routes to proximity (group channels still require
-    // an explicit PTT — accidentally broadcasting on clan/ally without
-    // intent would be terrible).
+    // Channel priority on multi-PTT-held: party > clan > ally > proximity.
+    // The narrower group wins so pressing party + ally simultaneously
+    // talks to party (the smaller circle). always_on only fires
+    // proximity — accidentally broadcasting on a group channel without
+    // an explicit press would be a footgun.
     auto held = [](int vk) -> bool {
         return vk != 0 && (GetAsyncKeyState(vk) & 0x8000) != 0;
     };
     uint8_t channel = 0xFF;   // none
-    if      (held(g_mod.cfg.ptt_ally))      channel = 3;
+    if      (held(g_mod.cfg.ptt_party))     channel = 1;
     else if (held(g_mod.cfg.ptt_clan))      channel = 2;
-    else if (held(g_mod.cfg.ptt_party))     channel = 1;
+    else if (held(g_mod.cfg.ptt_ally))      channel = 3;
     else if (held(g_mod.cfg.ptt_proximity)
           || g_mod.cfg.always_on)           channel = 0;
     bool transmit = focused && channel != 0xFF;
@@ -376,6 +377,10 @@ void GetSpeakerList(SpeakerInfo* out, size_t cap, size_t& count) {
 }
 void SetSpeakerMuted(uint32_t src_id, bool muted) {
     g_mod.playback.SetSourceMuted(src_id, muted);
+}
+
+void SetSpeakerVolume(uint32_t src_id, float volume) {
+    g_mod.playback.SetSourceVolume(src_id, volume);
 }
 
 bool GetSpeakerName(uint32_t src_id, char* out, size_t cap) {

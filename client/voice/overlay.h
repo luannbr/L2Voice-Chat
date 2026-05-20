@@ -53,6 +53,7 @@ void SetMasterVolume(float gain);
 struct SpeakerInfo;
 void GetSpeakerList(SpeakerInfo* out, size_t cap, size_t& count);
 void SetSpeakerMuted(uint32_t src_id, bool muted);
+void SetSpeakerVolume(uint32_t src_id, float volume);
 
 // Resolves the character name for a speaker. Returns true + fills out
 // when known, false otherwise. Triggers an async query the first time

@@ -65,9 +65,10 @@ struct Source {
     MonoRing ring;
     // gain and pan are supplied by the caller (service computes them
     // from L2J positions in protocol rev 2). No spatial math here.
-    float    gain  = 0.0f;       // 0..1
-    float    pan   = 0.0f;       // -1..+1
-    bool     muted = false;
+    float    gain   = 0.0f;       // 0..1 (service-computed)
+    float    pan    = 0.0f;       // -1..+1
+    float    volume = 1.0f;       // per-source slider, 0..2
+    bool     muted  = false;
     std::chrono::steady_clock::time_point last_mix{};
 };
 
@@ -170,7 +171,8 @@ struct AudioPlayback::Impl {
 
             float lpan, rpan;
             PanGains(src.pan, lpan, rpan);
-            float gain = src.gain * master;
+            // gain (server-computed) × per-source volume × master
+            float gain = src.gain * src.volume * master;
 
             for (uint32_t i = 0; i < got; ++i) {
                 int32_t l = out[i * 2 + 0] + (int32_t)(mono[i] * lpan * gain);
@@ -254,6 +256,7 @@ void AudioPlayback::GetSpeakerInfos(SpeakerInfo* out, size_t cap, size_t& count)
                       now - src.last_mix).count();
         out[count].src_id       = id;
         out[count].gain         = src.gain;
+        out[count].volume       = src.volume;
         out[count].muted        = src.muted;
         out[count].ms_since_mix = (int)ms;
         ++count;
@@ -278,6 +281,20 @@ bool AudioPlayback::IsSourceMuted(uint32_t src_id) {
     std::lock_guard<std::mutex> lk(impl_->sources_mu);
     auto it = impl_->sources.find(src_id);
     return it != impl_->sources.end() && it->second.muted;
+}
+
+void AudioPlayback::SetSourceVolume(uint32_t src_id, float volume) {
+    if (volume < 0.f) volume = 0.f;
+    if (volume > 2.f) volume = 2.f;
+    std::lock_guard<std::mutex> lk(impl_->sources_mu);
+    // If the source doesn't exist yet (audio hasn't started), create
+    // a placeholder so the volume is remembered when audio arrives.
+    impl_->sources[src_id].volume = volume;
+}
+float AudioPlayback::GetSourceVolume(uint32_t src_id) {
+    std::lock_guard<std::mutex> lk(impl_->sources_mu);
+    auto it = impl_->sources.find(src_id);
+    return it != impl_->sources.end() ? it->second.volume : 1.0f;
 }
 
 }  // namespace voice

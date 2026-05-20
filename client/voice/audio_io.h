@@ -38,10 +38,11 @@ private:
 // ---- Playback / mixer -----------------------------------------------
 
 // One row of GetSpeakerInfos output — the overlay uses it to render
-// the live speaker list with per-source mute controls.
+// the live speaker list with per-source mute / volume controls.
 struct SpeakerInfo {
     uint32_t src_id;
-    float    gain;          // last-applied gain (0..1, before mute)
+    float    gain;          // last-applied gain (0..1, before mute/volume)
+    float    volume;        // per-source slider value (0..2, default 1.0)
     bool     muted;
     int      ms_since_mix;  // how long ago this source last produced audio
 };
@@ -84,6 +85,13 @@ public:
     // be ok with that). Pass true to silence, false to unmute.
     void SetSourceMuted(uint32_t src_id, bool muted);
     bool IsSourceMuted(uint32_t src_id);
+
+    // Per-source volume multiplier (0..2, default 1.0). Applied AFTER
+    // the service-stamped gain and BEFORE the master multiplier.
+    // Lets the user boost / attenuate individual speakers from the
+    // overlay's per-row slider.
+    void  SetSourceVolume(uint32_t src_id, float volume);
+    float GetSourceVolume(uint32_t src_id);
 
 private:
     struct Impl;

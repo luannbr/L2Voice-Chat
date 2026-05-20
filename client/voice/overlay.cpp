@@ -494,6 +494,7 @@ void DrawProximityTab(const OverlayState& st) {
             SetSpeakerMuted(infos[i].src_id, m);
         }
         ImGui::SameLine();
+
         bool speaking = infos[i].ms_since_mix < 200;
         ImVec4 col = speaking ? ImVec4(74/255.f, 222/255.f, 128/255.f, 1.0f)
                               : ImVec4(232/255.f, 234/255.f, 240/255.f, 1.0f);
@@ -506,13 +507,18 @@ void DrawProximityTab(const OverlayState& st) {
             ImGui::Text("sid=%u", infos[i].src_id);
         }
         ImGui::PopStyleColor();
-        if (speaking) {
-            ImGui::SameLine();
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                ImVec4(74/255.f, 222/255.f, 128/255.f, 1.0f));
-            ImGui::TextUnformatted("●");
-            ImGui::PopStyleColor();
+
+        // Per-player volume slider — compact, right-anchored. Drag to
+        // boost/attenuate this single speaker. Default 1.0.
+        const float sliderW = 80.0f;
+        ImGui::SameLine(ImGui::GetWindowWidth() - sliderW - 12.0f);
+        float v = infos[i].volume;
+        ImGui::PushItemWidth(sliderW);
+        if (ImGui::SliderFloat("##vol", &v, 0.0f, 2.0f, "",
+                ImGuiSliderFlags_NoInput)) {
+            SetSpeakerVolume(infos[i].src_id, v);
         }
+        ImGui::PopItemWidth();
         ImGui::PopID();
     }
     ImGui::EndChild();
