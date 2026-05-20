@@ -49,6 +49,12 @@ const (
 	chPingResp  uint8 = 7
 )
 
+// rxCount is a session-id keyed counter of inbound proximity packets,
+// used only for diagnostic log throttling. Not thread-safe by itself,
+// but the UDP loop is single-threaded so concurrent writes can't
+// happen.
+var rxCount = map[uint32]uint64{}
+
 // Config bundles router-mode flags.
 type Config struct {
 	// Echo: every proximity packet is bounced back to its sender
@@ -112,6 +118,7 @@ func Serve(ctx context.Context, udpAddr string, state *topology.State, cfg Confi
 			continue
 		}
 		if sess.UDPAddr == nil || sess.UDPAddr.String() != from.String() {
+			log.Printf("audio: sid=%d learned UDPAddr=%s (ch=%d)", sid, from, channel)
 			state.RememberUDP(sess, from)
 		}
 
@@ -147,6 +154,14 @@ func routeProximity(seqLo uint16, srcSID uint32, opus []byte,
 	now := time.Now()
 	speakerHasPos := speaker.PositionKnown(now)
 
+	// Diagnostic: per-session rolling counter so the operator can see
+	// audio is actually arriving server-side.
+	rxCount[srcSID]++
+	if rxCount[srcSID]%50 == 1 {
+		log.Printf("audio: sid=%d rx=#%d speakerPos=%v",
+			srcSID, rxCount[srcSID], speakerHasPos)
+	}
+
 	// Egress buffer (header + spatial + opus). Reused per send.
 	out := make([]byte, 10+len(opus))
 	out[0] = 1                 // version
@@ -168,8 +183,22 @@ func routeProximity(seqLo uint16, srcSID uint32, opus []byte,
 		return
 	}
 
-	for _, recv := range state.ProximityNeighbors(speaker, MaxDistance) {
-		if recv.UDPAddr == nil || !recv.PositionKnown(now) {
+	neighbors := state.ProximityNeighbors(speaker, MaxDistance)
+	if rxCount[srcSID]%50 == 1 {
+		log.Printf("audio: sid=%d neighbors=%d (max range %.0fcm)",
+			srcSID, len(neighbors), MaxDistance)
+	}
+	for _, recv := range neighbors {
+		if recv.UDPAddr == nil {
+			if rxCount[srcSID]%50 == 1 {
+				log.Printf("audio:   skip recv sid=%d — no UDPAddr yet", recv.ID)
+			}
+			continue
+		}
+		if !recv.PositionKnown(now) {
+			if rxCount[srcSID]%50 == 1 {
+				log.Printf("audio:   skip recv sid=%d — no position", recv.ID)
+			}
 			continue
 		}
 		dx := speaker.X - recv.X
@@ -193,6 +222,10 @@ func routeProximity(seqLo uint16, srcSID uint32, opus []byte,
 
 		out[8] = uint8(gainF*255 + 0.5)
 		out[9] = byte(int8(panF*127 + 0.5))
-		_, _ = conn.WriteToUDP(out, recv.UDPAddr)
+		n, werr := conn.WriteToUDP(out, recv.UDPAddr)
+		if rxCount[srcSID]%50 == 1 {
+			log.Printf("audio:   -> recv sid=%d dist=%.0f gain=%d wrote=%d err=%v",
+				recv.ID, dist, out[8], n, werr)
+		}
 	}
 }

@@ -19,10 +19,12 @@
 #pragma comment(lib, "ws2_32.lib")
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -40,6 +42,7 @@ struct Mod {
     AudioPlayback playback;
     OpusEncoder   encoder;
     VoiceNetwork  net;
+    std::thread   keepalive_thread;
 
     std::mutex dec_mu;
     std::unordered_map<uint32_t, std::unique_ptr<OpusDecoder>> decoders;
@@ -66,6 +69,19 @@ void OnCaptureFrame(const int16_t* pcm, uint32_t samples) {
     if (g_mod.cfg.ptt_proximity != 0) {
         ptt = (GetAsyncKeyState(g_mod.cfg.ptt_proximity) & 0x8000) != 0;
     }
+
+    // Diagnostic counter: every 50 frames (~1s) report state so we can
+    // see capture + PTT + ws state from DebugView.
+    static uint32_t cap_frames = 0;
+    if ((++cap_frames % 50) == 0) {
+        char dbg[160];
+        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+            "[l2voice] capture=%u ptt=%d ws_connected=%d sid=%u\n",
+            cap_frames, ptt ? 1 : 0,
+            g_mod.net.IsConnected() ? 1 : 0, g_mod.net.SessionID());
+        OutputDebugStringA(dbg);
+    }
+
     if (!ptt) return;
     if (!g_mod.net.IsConnected()) return;
 
@@ -73,6 +89,13 @@ void OnCaptureFrame(const int16_t* pcm, uint32_t samples) {
     int n = g_mod.encoder.Encode(pcm, opus_buf, sizeof(opus_buf));
     if (n <= 0) return;
 
+    static uint32_t sent = 0;
+    if ((++sent % 50) == 1) {  // every ~1s of speech
+        char dbg[96];
+        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+            "[l2voice] SendProximityFrame #%u (%d bytes opus)\n", sent, n);
+        OutputDebugStringA(dbg);
+    }
     uint16_t seq = g_mod.tx_seq.fetch_add(1, std::memory_order_relaxed);
     g_mod.net.SendProximityFrame(seq, opus_buf, n);
 }
@@ -80,6 +103,14 @@ void OnCaptureFrame(const int16_t* pcm, uint32_t samples) {
 void OnIncomingPacket(uint8_t channel, uint32_t src, uint16_t /*seq*/,
                       uint8_t gain_u8, int8_t pan_i8,
                       const uint8_t* opus_payload, uint16_t opus_len) {
+    static uint32_t rx = 0;
+    if ((++rx % 50) == 1) {
+        char dbg[160];
+        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+            "[l2voice] recv #%u ch=%u src=%u gain=%u pan=%d opus=%u\n",
+            rx, channel, src, gain_u8, pan_i8, opus_len);
+        OutputDebugStringA(dbg);
+    }
     // Channel 0 = proximity (gain/pan supplied by service).
     // Channels 1..4 = group voice (gain=255 pan=0 by convention).
     if (channel > 4) return;
@@ -208,6 +239,23 @@ bool Init(const Config& cfg) {
     }
 
     g_mod.running.store(true);
+
+    // Keepalive thread: every 5s the DLL emits a UDP header-only
+    // packet so the voice-service learns (and refreshes) our UDP
+    // source address. WITHOUT this, the service only knows the UDP
+    // addrs of clients that are actively transmitting audio — so
+    // listeners-who-haven't-spoken-yet never receive anything.
+    g_mod.keepalive_thread = std::thread([] {
+        using namespace std::chrono;
+        while (g_mod.running.load(std::memory_order_acquire)) {
+            for (int i = 0; i < 10 && g_mod.running.load(); ++i) {
+                std::this_thread::sleep_for(milliseconds(500));
+            }
+            if (g_mod.net.IsConnected() && g_mod.net.SessionID() != 0) {
+                g_mod.net.SendKeepalive();
+            }
+        }
+    });
     return true;
 }
 
@@ -226,6 +274,7 @@ void RefreshClientPorts() {
 
 void Shutdown() {
     if (!g_mod.running.exchange(false)) return;
+    if (g_mod.keepalive_thread.joinable()) g_mod.keepalive_thread.join();
     g_mod.capture.Stop();
     g_mod.net.Stop();
     g_mod.playback.Stop();

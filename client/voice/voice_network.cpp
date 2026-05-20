@@ -205,18 +205,43 @@ struct VoiceNetwork::Impl {
     }
 
     void HandleWsMessage(const std::string& s) {
-        if (s.find("\"auth_ok\"") == std::string::npos) return;
+        if (s.find("\"auth_ok\"") == std::string::npos) {
+            // Other message types (auth_fail, topology_update, etc.) —
+            // not handled in this minimal client.
+            return;
+        }
         uint64_t sid_u = 0;
-        if (!ExtractNumber(s, "session_id", sid_u)) return;
-        std::string host;
-        uint64_t port_u = 0;
-        if (!ExtractString(s, "udp_host", host)) return;
-        if (!ExtractNumber(s, "udp_port", port_u)) return;
+        if (!ExtractNumber(s, "session_id", sid_u)) {
+            OutputDebugStringA("[l2voice] auth_ok missing session_id\n");
+            return;
+        }
+        // Voice-service sends a single "udp_endpoint":"host:port" string.
+        std::string endpoint;
+        if (!ExtractString(s, "udp_endpoint", endpoint)) {
+            OutputDebugStringA("[l2voice] auth_ok missing udp_endpoint\n");
+            return;
+        }
+        auto colon = endpoint.rfind(':');
+        if (colon == std::string::npos) {
+            OutputDebugStringA("[l2voice] udp_endpoint missing ':'\n");
+            return;
+        }
+        std::string host = endpoint.substr(0, colon);
+        uint16_t port = (uint16_t)std::stoi(endpoint.substr(colon + 1));
+        if (port == 0) {
+            OutputDebugStringA("[l2voice] udp_endpoint port=0\n");
+            return;
+        }
         session_id.store((uint32_t)sid_u);
         udp_host = host;
-        udp_port.store((uint16_t)port_u);
-        SetUdpDest(host, (uint16_t)port_u);
-        if (on_auth) on_auth((uint32_t)sid_u, host.c_str(), (uint16_t)port_u);
+        udp_port.store(port);
+        SetUdpDest(host, port);
+        char dbg[160];
+        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+            "[l2voice] auth_ok session_id=%u udp_endpoint=%s:%u\n",
+            (uint32_t)sid_u, host.c_str(), port);
+        OutputDebugStringA(dbg);
+        if (on_auth) on_auth((uint32_t)sid_u, host.c_str(), port);
     }
 };
 
@@ -261,7 +286,13 @@ void VoiceNetwork::SetClientPorts(const uint16_t* ports, size_t count) {
 
 void VoiceNetwork::SendProximityFrame(uint16_t seq,
                                       const uint8_t* opus, int opus_len) {
-    if (impl_->udp_port.load() == 0) return;
+    if (impl_->udp_port.load() == 0) {
+        static int once = 0;
+        if (once++ == 0) {
+            OutputDebugStringA("[l2voice] SendProximityFrame skipped — udp_port==0 (auth_ok not parsed)\n");
+        }
+        return;
+    }
     if (opus_len <= 0 || opus_len > 1024) return;
 
     uint8_t pkt[1100];

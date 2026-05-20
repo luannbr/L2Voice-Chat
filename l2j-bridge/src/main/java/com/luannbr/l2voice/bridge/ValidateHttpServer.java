@@ -157,6 +157,7 @@ final class ValidateHttpServer {
                 log.log(Level.WARNING, "findPlayerByConnection failed", t);
             }
         }
+        log.info("whoami ip=" + ip + " ports=" + ports + " -> player_id=" + pid);
         respond(ex, 200, "{\"player_id\":" + pid + "}");
     }
 

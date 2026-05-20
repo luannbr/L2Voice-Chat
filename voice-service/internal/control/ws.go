@@ -123,6 +123,7 @@ func handleWS(ctx context.Context, w http.ResponseWriter, r *http.Request, state
 
 	// Extract client IP from the WS connection's remote addr.
 	clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
+	log.Printf("control: %s auth ports=%v clientIP=%q", r.RemoteAddr, msg.Ports, clientIP)
 
 	// Resolve identity server-side via /voice/whoami.
 	playerID, err := whoamiLookup(clientIP, msg.Ports)
