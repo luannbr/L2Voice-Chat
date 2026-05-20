@@ -31,6 +31,12 @@
 #include <cstdarg>
 #include <cstdio>
 
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_NO_HDR
+#define STBI_NO_LINEAR
+#define STBI_ONLY_PNG
+#include <stb_image.h>
+
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
     HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
@@ -45,6 +51,8 @@ EndScene_t      g_origEndScene = nullptr;
 Reset_t         g_origReset    = nullptr;
 WNDPROC         g_origWndProc  = nullptr;
 HWND            g_targetHwnd   = nullptr;
+IDirect3DTexture9* g_micTexture = nullptr;
+int             g_micW = 0, g_micH = 0;
 ImGuiContext*   g_imguiCtx     = nullptr;
 std::atomic<bool> g_imguiBackendInit{false};
 std::atomic<bool> g_visible{true};
@@ -205,6 +213,74 @@ void Logf(const char* fmt, ...) {
     _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, ap);
     va_end(ap);
     OutputDebugStringA(buf);
+}
+
+// Loads voice-recorder.png from the directory the DLL itself was
+// loaded from, decodes it via stb_image, and uploads to a managed
+// D3D9 texture. Returns the texture pointer (and out w/h) on
+// success; nullptr on any failure (file missing, decode error, GPU
+// upload fail) — the minimize state silently falls back to text.
+IDirect3DTexture9* LoadPngAsTexture(IDirect3DDevice9* dev,
+        const wchar_t* path, int& w, int& h) {
+    // Read the file ourselves so stb_image (which is ASCII-path only)
+    // doesn't choke on Unicode paths.
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return nullptr;
+    LARGE_INTEGER sz; GetFileSizeEx(f, &sz);
+    if (sz.QuadPart <= 0 || sz.QuadPart > 8 * 1024 * 1024) {
+        CloseHandle(f); return nullptr;
+    }
+    std::vector<unsigned char> buf((size_t)sz.QuadPart);
+    DWORD read = 0;
+    BOOL ok = ReadFile(f, buf.data(), (DWORD)buf.size(), &read, nullptr);
+    CloseHandle(f);
+    if (!ok || read != buf.size()) return nullptr;
+
+    int c = 0;
+    unsigned char* px = stbi_load_from_memory(buf.data(), (int)buf.size(),
+        &w, &h, &c, 4);
+    if (!px) return nullptr;
+
+    IDirect3DTexture9* tex = nullptr;
+    if (FAILED(dev->CreateTexture(w, h, 1, 0, D3DFMT_A8R8G8B8,
+            D3DPOOL_MANAGED, &tex, nullptr))) {
+        stbi_image_free(px);
+        return nullptr;
+    }
+    D3DLOCKED_RECT lr;
+    if (FAILED(tex->LockRect(0, &lr, nullptr, 0))) {
+        tex->Release(); stbi_image_free(px); return nullptr;
+    }
+    // stb_image gives RGBA; D3DFMT_A8R8G8B8 wants BGRA in memory.
+    for (int y = 0; y < h; ++y) {
+        unsigned char* src = px + y * w * 4;
+        unsigned char* dst = (unsigned char*)lr.pBits + y * lr.Pitch;
+        for (int x = 0; x < w; ++x) {
+            dst[x*4 + 0] = src[x*4 + 2];   // B
+            dst[x*4 + 1] = src[x*4 + 1];   // G
+            dst[x*4 + 2] = src[x*4 + 0];   // R
+            dst[x*4 + 3] = src[x*4 + 3];   // A
+        }
+    }
+    tex->UnlockRect(0);
+    stbi_image_free(px);
+    return tex;
+}
+
+// Builds the absolute path to a file in the same directory as this
+// DLL (resolved via GetModuleHandleEx on a function in our module).
+void ResolveDllRelativePath(const wchar_t* name,
+        wchar_t* out, size_t cap) {
+    HMODULE self = nullptr;
+    GetModuleHandleExW(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCWSTR>(&LoadPngAsTexture), &self);
+    GetModuleFileNameW(self, out, (DWORD)cap);
+    wchar_t* slash = wcsrchr(out, L'\\');
+    if (slash) *(slash + 1) = 0;
+    wcsncat_s(out, cap, name, _TRUNCATE);
 }
 
 void VkToString(int vk, char* out, size_t cap) {
@@ -502,18 +578,25 @@ void DrawMinimized() {
         g_minimized.store(false);
     }
 
-    // Centered "VOX" text in gold.
-    const char* label = "VOX";
-    ImVec2 ts = ImGui::CalcTextSize(label);
-    ImVec2 tp = ImVec2(p0.x + (56 - ts.x) * 0.5f, p0.y + (56 - ts.y) * 0.5f);
-    ImU32 col = hovered ? IM_COL32(0xff, 0xd6, 0x60, 0xff)
-                        : IM_COL32(0xd4, 0xaf, 0x37, 0xff);
-    dl->AddText(tp, col, label);
-
-    // Subtle hint below on hover
-    if (hovered) {
-        dl->AddText(ImVec2(p0.x + 4, p1.y - 12),
-            IM_COL32(0xa8, 0x90, 0x60, 0xff), "double-click");
+    // Centered microphone glyph: PNG if we managed to load it,
+    // otherwise fall back to "VOX" text in gold.
+    if (g_micTexture) {
+        const float pad = 8.0f;
+        ImVec2 imgP0(p0.x + pad, p0.y + pad);
+        ImVec2 imgP1(p1.x - pad, p1.y - pad);
+        // Tint: dim gold normally, brighter on hover.
+        ImU32 tint = hovered
+            ? IM_COL32(0xff, 0xd6, 0x60, 0xff)
+            : IM_COL32(0xd4, 0xaf, 0x37, 0xff);
+        dl->AddImage(reinterpret_cast<ImTextureID>(g_micTexture),
+            imgP0, imgP1, ImVec2(0, 0), ImVec2(1, 1), tint);
+    } else {
+        const char* label = "VOX";
+        ImVec2 ts = ImGui::CalcTextSize(label);
+        ImVec2 tp = ImVec2(p0.x + (56 - ts.x) * 0.5f, p0.y + (56 - ts.y) * 0.5f);
+        ImU32 col = hovered ? IM_COL32(0xff, 0xd6, 0x60, 0xff)
+                            : IM_COL32(0xd4, 0xaf, 0x37, 0xff);
+        dl->AddText(tp, col, label);
     }
     ImGui::End();
 }
@@ -540,10 +623,11 @@ void DrawPanel() {
     }
 
     // Custom minimize button — right-aligned on its own row before the
-    // tabs. Click → render as a 56x56 icon next frame.
-    float btnW = ImGui::CalcTextSize("[—]").x + 12.0f;
+    // tabs. Click → render as a 56x56 icon next frame. Use "_" since
+    // the default ImGui font ships only ASCII (em-dash renders as "?").
+    float btnW = ImGui::CalcTextSize("_").x + 16.0f;
     ImGui::SetCursorPosX(ImGui::GetWindowWidth() - btnW - 6.0f);
-    if (ImGui::SmallButton("[—]##min")) {
+    if (ImGui::SmallButton(" _ ##min")) {
         g_minimized.store(true);
     }
 
@@ -594,7 +678,7 @@ void DrawPanel() {
     }
 
     ImGui::Separator();
-    ImGui::TextDisabled("Insert hides  ·  [—] minimizes  ·  drag titlebar to move");
+    ImGui::TextDisabled("Insert hides  ·  _ minimizes  ·  drag titlebar to move");
     ImGui::End();
 }
 
@@ -690,6 +774,18 @@ HRESULT WINAPI HookEndScene(IDirect3DDevice9* dev) {
         g_origWndProc = reinterpret_cast<WNDPROC>(
             SetWindowLongPtrW(hwnd, GWLP_WNDPROC,
                               reinterpret_cast<LONG_PTR>(&HookedWndProc)));
+
+        // Load the microphone icon for the minimized state. Lives next
+        // to l2voice.dll. Falls back to text if missing.
+        wchar_t iconPath[MAX_PATH];
+        ResolveDllRelativePath(L"voice-recorder.png", iconPath, MAX_PATH);
+        g_micTexture = LoadPngAsTexture(dev, iconPath, g_micW, g_micH);
+        if (g_micTexture) {
+            Logf("[l2voice] icon loaded: %dx%d\n", g_micW, g_micH);
+        } else {
+            Logf("[l2voice] icon NOT loaded (path=%ws) — fallback to text\n",
+                iconPath);
+        }
 
         g_imguiBackendInit.store(true);
     }

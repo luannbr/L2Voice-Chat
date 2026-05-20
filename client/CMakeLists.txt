@@ -48,6 +48,18 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(miniaudio)
 
+# ---- stb_image (Public Domain) — PNG loader for the icon ------------
+FetchContent_Declare(
+    stb
+    GIT_REPOSITORY https://github.com/nothings/stb.git
+    GIT_TAG master
+    GIT_SHALLOW TRUE
+)
+FetchContent_GetProperties(stb)
+if(NOT stb_POPULATED)
+    FetchContent_Populate(stb)
+endif()
+
 # ---- MinHook (BSD-2-Clause) — used by the D3D9 EndScene hook --------
 FetchContent_Declare(
     minhook
@@ -106,6 +118,7 @@ target_include_directories(l2voice PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/voice
     ${miniaudio_SOURCE_DIR}
+    ${stb_SOURCE_DIR}
 )
 
 target_link_libraries(l2voice PRIVATE
