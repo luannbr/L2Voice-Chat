@@ -640,48 +640,19 @@ void DrawPanel() {
         return;
     }
 
-    // ---- Minimize button drawn DIRECTLY on the title bar ----
-    // Use an InvisibleButton positioned via SetCursorScreenPos at the
-    // title-bar's right corner. InvisibleButton is a real ImGui item,
-    // so the window-drag system skips its rectangle and our
-    // IsItemClicked fires reliably. Visual (background + border + "_")
-    // is drawn on the FOREGROUND drawlist so it isn't clipped by the
-    // window content area (GetWindowDrawList would have clipped it).
-    {
-        ImGuiStyle& s = ImGui::GetStyle();
-        const float titleH = ImGui::GetFontSize() + s.FramePadding.y * 2;
-        ImVec2 winP   = ImGui::GetWindowPos();
-        float  winW   = ImGui::GetWindowWidth();
-        const float btnSz = titleH - 4;
-        ImVec2 btnMin(winP.x + winW - btnSz - 6, winP.y + 2);
-        ImVec2 btnMax(btnMin.x + btnSz, btnMin.y + btnSz);
-
-        // Save cursor so the rest of the body lays out normally after.
-        ImVec2 savedCursor = ImGui::GetCursorScreenPos();
-        ImGui::SetCursorScreenPos(btnMin);
-        ImGui::InvisibleButton("##title_min", ImVec2(btnSz, btnSz));
-        bool hovered = ImGui::IsItemHovered();
-        if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
-            g_minimized.store(true);
-        }
-        ImGui::SetCursorScreenPos(savedCursor);
-
-        ImDrawList* dl = ImGui::GetForegroundDrawList();
-        ImU32 bg = hovered
-            ? IM_COL32(0xd4, 0xaf, 0x37, 0x55)
-            : IM_COL32(0x2a, 0x1f, 0x15, 0xff);
-        dl->AddRectFilled(btnMin, btnMax, bg, 2.0f);
-        ImU32 border = IM_COL32(0x8b, 0x69, 0x14, 0xff);
-        dl->AddRect(btnMin, btnMax, border, 2.0f, 0, 1.0f);
-        ImU32 fg = hovered
-            ? IM_COL32(0xff, 0xd6, 0x60, 0xff)
-            : IM_COL32(0xd4, 0xaf, 0x37, 0xff);
-        // "_" — manual gold line at the bottom of the box (underscore
-        // glyph would baseline-float too low).
-        float midY = btnMax.y - 4;
-        dl->AddLine(ImVec2(btnMin.x + 4, midY),
-                    ImVec2(btnMax.x - 4, midY), fg, 2.0f);
-    }
+    // ---- Minimize button on the title bar ----
+    // Drawn as a SEPARATE ImGui window floated over the main panel's
+    // title bar. Earlier attempts (InvisibleButton inside the main
+    // window with SetCursorScreenPos at title-bar Y) failed because
+    // ImGui's per-window clip rect culls items positioned outside
+    // the content area. A standalone window has its own clip rect
+    // covering exactly the button. Drawn AFTER the main panel's
+    // ImGui::End so it appears on top.
+    //
+    // (We just stash the pos+width here; actual rendering happens
+    // below, after we End the main panel.)
+    ImVec2 mainPanelPos = ImGui::GetWindowPos();
+    float  mainPanelW   = ImGui::GetWindowWidth();
 
     // ====== Session + player name ======
     // Both rows right-anchor their chip to the same X so the values
@@ -734,6 +705,55 @@ void DrawPanel() {
     ImGui::Separator();
     ImGui::TextDisabled("Insert hides");
     ImGui::End();
+
+    // ---- Floating minimize button overlapping the main panel's title bar ----
+    {
+        ImGuiStyle& s = ImGui::GetStyle();
+        const float titleH = ImGui::GetFontSize() + s.FramePadding.y * 2;
+        const float btnSz = titleH - 4;
+        ImVec2 btnPos(mainPanelPos.x + mainPanelW - btnSz - 6,
+                      mainPanelPos.y + 2);
+        ImGui::SetNextWindowPos(btnPos);
+        ImGui::SetNextWindowSize(ImVec2(btnSz, btnSz));
+        ImGuiWindowFlags wf = ImGuiWindowFlags_NoTitleBar
+                            | ImGuiWindowFlags_NoResize
+                            | ImGuiWindowFlags_NoMove
+                            | ImGuiWindowFlags_NoScrollbar
+                            | ImGuiWindowFlags_NoCollapse
+                            | ImGuiWindowFlags_NoSavedSettings
+                            | ImGuiWindowFlags_NoBackground;
+        // Tight padding so the button fills the window.
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+        if (ImGui::Begin("##l2voice_min_btn", nullptr, wf)) {
+            // Custom-drawn gold button. We render visuals via the
+            // window's drawlist (clip rect IS this window, so it works
+            // fine here) and use an InvisibleButton for hit-test.
+            ImVec2 wp = ImGui::GetWindowPos();
+            ImVec2 wEnd(wp.x + btnSz, wp.y + btnSz);
+            ImGui::SetCursorPos(ImVec2(0, 0));
+            ImGui::InvisibleButton("##hit", ImVec2(btnSz, btnSz));
+            bool hovered = ImGui::IsItemHovered();
+            if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+                g_minimized.store(true);
+            }
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            ImU32 bg = hovered
+                ? IM_COL32(0xd4, 0xaf, 0x37, 0x55)
+                : IM_COL32(0x2a, 0x1f, 0x15, 0xff);
+            dl->AddRectFilled(wp, wEnd, bg, 2.0f);
+            ImU32 border = IM_COL32(0x8b, 0x69, 0x14, 0xff);
+            dl->AddRect(wp, wEnd, border, 2.0f, 0, 1.0f);
+            ImU32 fg = hovered
+                ? IM_COL32(0xff, 0xd6, 0x60, 0xff)
+                : IM_COL32(0xd4, 0xaf, 0x37, 0xff);
+            float midY = wEnd.y - 4;
+            dl->AddLine(ImVec2(wp.x + 4, midY),
+                        ImVec2(wEnd.x - 4, midY), fg, 2.0f);
+        }
+        ImGui::End();
+        ImGui::PopStyleVar(2);
+    }
 }
 
 // =============================================================
