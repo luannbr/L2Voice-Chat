@@ -162,6 +162,11 @@ struct VoiceNetwork::Impl {
     void StartWs() {
         ws.setUrl(ws_url);
         ws.setPingInterval(20);
+        // Cap reconnect backoff so "first audio after EnterWorld" is
+        // sub-second. Default max is 10 s+ which gets ugly if the
+        // server has been closing pre-auth attempts during login.
+        ws.setMinWaitBetweenReconnectionRetries(200);   // ms
+        ws.setMaxWaitBetweenReconnectionRetries(2000);  // ms
         ws.setOnMessageCallback([this](const ix::WebSocketMessagePtr& msg) {
             switch (msg->type) {
                 case ix::WebSocketMessageType::Open:

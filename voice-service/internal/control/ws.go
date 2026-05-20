@@ -102,9 +102,15 @@ func handleWS(ctx context.Context, w http.ResponseWriter, r *http.Request, state
 	defer conn.Close()
 	log.Printf("control: %s connected (UA=%q)", r.RemoteAddr, r.Header.Get("User-Agent"))
 
-	// Read auth as the first message; deadline so a non-talking
-	// client can't sit on a socket forever.
-	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	// Read auth as the first message. The deadline is generous —
+	// the DLL connects on L2.exe startup and only knows enough to
+	// auth once the user has clicked through to in-world (the
+	// GS TCP socket appears in the process's port table). That can
+	// take a couple of minutes if the player lingers at character
+	// selection. Don't tear down the WS in that window or
+	// IXWebSocket reconnects with exponential backoff and ends up
+	// in a 10–30 s "first-audio" delay after entering the world.
+	conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 	_, raw, err := conn.ReadMessage()
 	if err != nil {
 		log.Printf("control: %s read auth failed: %v", r.RemoteAddr, err)
