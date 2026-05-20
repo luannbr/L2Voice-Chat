@@ -117,6 +117,8 @@ target_link_libraries(l2voice PRIVATE
     winmm
     iphlpapi
     d3d9
+    dinput8
+    dxguid
 )
 
 target_compile_definitions(l2voice PRIVATE

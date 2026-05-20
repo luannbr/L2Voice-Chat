@@ -19,6 +19,8 @@
 
 #include <windows.h>
 #include <d3d9.h>
+#define DIRECTINPUT_VERSION 0x0800
+#include <dinput.h>
 #include <MinHook.h>
 
 #include <imgui.h>
@@ -46,9 +48,14 @@ HWND            g_targetHwnd   = nullptr;
 ImGuiContext*   g_imguiCtx     = nullptr;
 std::atomic<bool> g_imguiBackendInit{false};
 std::atomic<bool> g_visible{true};
-std::atomic<bool> g_imguiCapturesMouse{false};  // sampled each frame; read by GetAsyncKeyState hook
+std::atomic<bool> g_minimized{false};
+std::atomic<bool> g_imguiCapturesMouse{false};  // sampled each frame; read by input hooks
 int             g_toggleVk      = VK_INSERT;
 std::atomic<bool> g_captureNextKey{false};
+
+// Forward-declared so the DI hooks below (which sit above the Helpers
+// section) can call into the same logger as everything else.
+void Logf(const char* fmt, ...);
 
 // GetAsyncKeyState hook — when ImGui's panel has the mouse focus,
 // return 0 for the mouse-button VKs so L2's polling-based input
@@ -70,6 +77,122 @@ SHORT WINAPI HookGetAsyncKeyState(int vk) {
     }
     if (g_origGetAsyncKeyState) return g_origGetAsyncKeyState(vk);
     return 0;
+}
+
+// ---- DirectInput8 hooks ---------------------------------------------
+//
+// L2 reads mouse buttons via IDirectInputDevice8 (Unreal Engine 2's
+// standard input path). That bypasses both our WndProc consume AND
+// our GetAsyncKeyState hook — the kernel still buffers mouse data
+// for DirectInput regardless of message processing.
+//
+// Approach: hook the *shared* vtable entries for GetDeviceState +
+// GetDeviceData on the SysMouse device. When ImGui captures the
+// mouse, scrub button data out of the result so the game sees zero
+// button presses. Mouse movement (axis data) is left alone so the
+// cursor still tracks normally.
+
+using PFN_DI_CreateDevice = HRESULT(STDMETHODCALLTYPE*)(
+    IDirectInput8A*, REFGUID, LPDIRECTINPUTDEVICE8A*, LPUNKNOWN);
+using PFN_DI_GetDeviceState = HRESULT(STDMETHODCALLTYPE*)(
+    IDirectInputDevice8A*, DWORD, LPVOID);
+using PFN_DI_GetDeviceData = HRESULT(STDMETHODCALLTYPE*)(
+    IDirectInputDevice8A*, DWORD, LPDIDEVICEOBJECTDATA, LPDWORD, DWORD);
+
+PFN_DI_CreateDevice    g_origCreateDevice = nullptr;
+PFN_DI_GetDeviceState  g_origGetDeviceState = nullptr;
+PFN_DI_GetDeviceData   g_origGetDeviceData = nullptr;
+std::atomic<bool>      g_diMouseHooked{false};
+
+HRESULT STDMETHODCALLTYPE HookDIGetDeviceState(
+        IDirectInputDevice8A* dev, DWORD size, LPVOID data) {
+    HRESULT hr = g_origGetDeviceState(dev, size, data);
+    if (FAILED(hr) || !data) return hr;
+    if (!g_imguiCapturesMouse.load(std::memory_order_relaxed)) return hr;
+    // Zero button bytes. DIMOUSESTATE2 = lX/lY/lZ then 8 rgbButtons;
+    // DIMOUSESTATE = 4 rgbButtons. Layout: button bytes start at +12.
+    if (size >= sizeof(DIMOUSESTATE2)) {
+        memset(&reinterpret_cast<DIMOUSESTATE2*>(data)->rgbButtons[0],
+               0, 8);
+    } else if (size >= sizeof(DIMOUSESTATE)) {
+        memset(&reinterpret_cast<DIMOUSESTATE*>(data)->rgbButtons[0],
+               0, 4);
+    }
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE HookDIGetDeviceData(
+        IDirectInputDevice8A* dev, DWORD size,
+        LPDIDEVICEOBJECTDATA data, LPDWORD count, DWORD flags) {
+    HRESULT hr = g_origGetDeviceData(dev, size, data, count, flags);
+    if (FAILED(hr) || !count || !data) return hr;
+    if (!g_imguiCapturesMouse.load(std::memory_order_relaxed)) return hr;
+    // Drop button events (rgbButtons offsets) from the buffered data.
+    DWORD writeIdx = 0;
+    for (DWORD i = 0; i < *count; ++i) {
+        DWORD ofs = data[i].dwOfs;
+        if (ofs >= DIMOFS_BUTTON0 && ofs <= DIMOFS_BUTTON0 + 7) continue;
+        if (writeIdx != i) data[writeIdx] = data[i];
+        ++writeIdx;
+    }
+    *count = writeIdx;
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE HookDICreateDevice(
+        IDirectInput8A* di, REFGUID rguid,
+        LPDIRECTINPUTDEVICE8A* dev, LPUNKNOWN unk) {
+    HRESULT hr = g_origCreateDevice(di, rguid, dev, unk);
+    if (FAILED(hr) || !dev || !*dev) return hr;
+    if (rguid == GUID_SysMouse &&
+            !g_diMouseHooked.exchange(true)) {
+        void** vt = *reinterpret_cast<void***>(*dev);
+        // vtable indices on IDirectInputDevice8: 9=GetDeviceState,
+        // 10=GetDeviceData.
+        void* gs  = vt[9];
+        void* gd  = vt[10];
+        Logf("[l2voice] hooking IDirectInputDevice8 vt: GetDeviceState=%p GetDeviceData=%p\n", gs, gd);
+        if (MH_CreateHook(gs,
+                reinterpret_cast<void*>(&HookDIGetDeviceState),
+                reinterpret_cast<void**>(&g_origGetDeviceState)) == MH_OK) {
+            MH_EnableHook(gs);
+        }
+        if (MH_CreateHook(gd,
+                reinterpret_cast<void*>(&HookDIGetDeviceData),
+                reinterpret_cast<void**>(&g_origGetDeviceData)) == MH_OK) {
+            MH_EnableHook(gd);
+        }
+    }
+    return hr;
+}
+
+void InstallDirectInputHook() {
+    HMODULE dinput8 = GetModuleHandleA("dinput8.dll");
+    if (!dinput8) dinput8 = LoadLibraryA("dinput8.dll");
+    if (!dinput8) {
+        Logf("[l2voice] dinput8.dll not loaded — DI hook skipped\n");
+        return;
+    }
+    using PFN_Create = HRESULT (WINAPI*)(HINSTANCE, DWORD, REFIID, LPVOID*, LPUNKNOWN);
+    auto pCreate = reinterpret_cast<PFN_Create>(
+        GetProcAddress(dinput8, "DirectInput8Create"));
+    if (!pCreate) return;
+    IDirectInput8A* di = nullptr;
+    HRESULT hr = pCreate(GetModuleHandleA(nullptr), DIRECTINPUT_VERSION,
+                         IID_IDirectInput8A, (void**)&di, nullptr);
+    if (FAILED(hr) || !di) {
+        Logf("[l2voice] DirectInput8Create failed: %08lx\n", hr);
+        return;
+    }
+    void** vt = *reinterpret_cast<void***>(di);
+    void* createDevAddr = vt[3];   // IDirectInput8::CreateDevice
+    di->Release();
+    Logf("[l2voice] hooking IDirectInput8::CreateDevice=%p\n", createDevAddr);
+    if (MH_CreateHook(createDevAddr,
+            reinterpret_cast<void*>(&HookDICreateDevice),
+            reinterpret_cast<void**>(&g_origCreateDevice)) == MH_OK) {
+        MH_EnableHook(createDevAddr);
+    }
 }
 
 // =============================================================
@@ -337,20 +460,91 @@ bool ShouldDrawFrame() {
     return st.session_id != 0;
 }
 
+// Small square icon (48x48) shown when the panel is minimized.
+// Visually: dark sepia background, gold border, "VOX" centered in
+// gold. Drag from anywhere on the icon. Double-click to restore.
+void DrawMinimized() {
+    ImGui::SetNextWindowSize(ImVec2(56, 56), ImGuiCond_Always);
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar
+                           | ImGuiWindowFlags_NoResize
+                           | ImGuiWindowFlags_NoScrollbar
+                           | ImGuiWindowFlags_NoCollapse
+                           | ImGuiWindowFlags_NoBackground;
+    if (!ImGui::Begin("##l2voice_min", nullptr, flags)) {
+        ImGui::End();
+        return;
+    }
+
+    ImVec2 p0 = ImGui::GetWindowPos();
+    ImVec2 p1 = ImVec2(p0.x + 56, p0.y + 56);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    // Sepia bg + double gold border (matches design 03 L2 Gothic feel)
+    dl->AddRectFilled(p0, p1,
+        IM_COL32(0x1a, 0x14, 0x10, 0xee), 4.0f);
+    dl->AddRect(p0, p1,
+        IM_COL32(0xd4, 0xaf, 0x37, 0xff), 4.0f, 0, 2.0f);
+    dl->AddRect(ImVec2(p0.x + 3, p0.y + 3), ImVec2(p1.x - 3, p1.y - 3),
+        IM_COL32(0x5a, 0x44, 0x10, 0xff), 2.0f, 0, 1.0f);
+
+    // Invisible button covering the whole icon for hit-testing.
+    ImGui::SetCursorPos(ImVec2(0, 0));
+    ImGui::InvisibleButton("##icon_hit", ImVec2(56, 56));
+    bool hovered = ImGui::IsItemHovered();
+    bool active  = ImGui::IsItemActive();
+
+    // Drag to move (when held + mouse delta).
+    if (active && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 1.0f)) {
+        ImVec2 d = ImGui::GetIO().MouseDelta;
+        ImGui::SetWindowPos(ImVec2(p0.x + d.x, p0.y + d.y));
+    }
+    // Double-click anywhere on icon → restore.
+    if (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+        g_minimized.store(false);
+    }
+
+    // Centered "VOX" text in gold.
+    const char* label = "VOX";
+    ImVec2 ts = ImGui::CalcTextSize(label);
+    ImVec2 tp = ImVec2(p0.x + (56 - ts.x) * 0.5f, p0.y + (56 - ts.y) * 0.5f);
+    ImU32 col = hovered ? IM_COL32(0xff, 0xd6, 0x60, 0xff)
+                        : IM_COL32(0xd4, 0xaf, 0x37, 0xff);
+    dl->AddText(tp, col, label);
+
+    // Subtle hint below on hover
+    if (hovered) {
+        dl->AddText(ImVec2(p0.x + 4, p1.y - 12),
+            IM_COL32(0xa8, 0x90, 0x60, 0xff), "double-click");
+    }
+    ImGui::End();
+}
+
 void DrawPanel() {
+    if (g_minimized.load()) {
+        DrawMinimized();
+        return;
+    }
+
     OverlayState st = SnapshotOverlayState();
 
     // Real ImGui window — title bar is back so the user can drag it
-    // around and ImGui's built-in title-bar collapse triangle acts
-    // as our minimize button. Window dragging and collapse are free.
+    // around. Built-in collapse is disabled (NoCollapse): we use our
+    // own minimize button that goes to a separate icon window.
     ImGui::SetNextWindowSize(ImVec2(320, 430), ImGuiCond_FirstUseEver);
     char titleBuf[64];
     _snprintf_s(titleBuf, sizeof(titleBuf), _TRUNCATE,
-        "l2voice  %s ###l2voice_window",
+        "l2voice  %s###l2voice_window",
         st.ws_connected ? "[connected]" : "[offline]");
-    if (!ImGui::Begin(titleBuf)) {
+    if (!ImGui::Begin(titleBuf, nullptr, ImGuiWindowFlags_NoCollapse)) {
         ImGui::End();
         return;
+    }
+
+    // Custom minimize button — right-aligned on its own row before the
+    // tabs. Click → render as a 56x56 icon next frame.
+    float btnW = ImGui::CalcTextSize("[—]").x + 12.0f;
+    ImGui::SetCursorPosX(ImGui::GetWindowWidth() - btnW - 6.0f);
+    if (ImGui::SmallButton("[—]##min")) {
+        g_minimized.store(true);
     }
 
     // ====== Session + player name (header info area) ======
@@ -400,7 +594,7 @@ void DrawPanel() {
     }
 
     ImGui::Separator();
-    ImGui::TextDisabled("Insert hides  ·  click triangle to collapse");
+    ImGui::TextDisabled("Insert hides  ·  [—] minimizes  ·  drag titlebar to move");
     ImGui::End();
 }
 
@@ -612,6 +806,11 @@ bool InstallOverlay() {
         Logf("[l2voice] overlay: MH_EnableHook(ALL) failed\n");
         return false;
     }
+
+    // DirectInput8 mouse-button filter (additional hook layer beyond
+    // WndProc + GetAsyncKeyState). DI lives in dinput8.dll and L2
+    // creates its mouse device there; we late-bind via vtable.
+    InstallDirectInputHook();
 
     IMGUI_CHECKVERSION();
     g_imguiCtx = ImGui::CreateContext();
