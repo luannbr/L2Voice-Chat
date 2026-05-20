@@ -216,12 +216,17 @@ void Logf(const char* fmt, ...) {
 }
 
 // Loads voice-recorder.png from the directory the DLL itself was
-// loaded from, decodes it via stb_image, and uploads to a managed
-// D3D9 texture. Returns the texture pointer (and out w/h) on
-// success; nullptr on any failure (file missing, decode error, GPU
-// upload fail) — the minimize state silently falls back to text.
+// loaded from, decodes it via stb_image, OPTIONALLY pre-tints all
+// non-transparent pixels to a solid color (the source PNG is black
+// with alpha — multiplying black × any tint at draw time stays
+// black, so we replace RGB here and keep the alpha as a mask), then
+// uploads to a managed D3D9 texture. Returns the texture pointer
+// (and out w/h) on success; nullptr on any failure.
+//
+// tintRgb: 0xRRGGBB to recolor opaque pixels; pass 0 to leave the
+// original colors alone.
 IDirect3DTexture9* LoadPngAsTexture(IDirect3DDevice9* dev,
-        const wchar_t* path, int& w, int& h) {
+        const wchar_t* path, int& w, int& h, uint32_t tintRgb = 0) {
     // Read the file ourselves so stb_image (which is ASCII-path only)
     // doesn't choke on Unicode paths.
     HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
@@ -253,14 +258,27 @@ IDirect3DTexture9* LoadPngAsTexture(IDirect3DDevice9* dev,
         tex->Release(); stbi_image_free(px); return nullptr;
     }
     // stb_image gives RGBA; D3DFMT_A8R8G8B8 wants BGRA in memory.
+    // If tint is non-zero, replace RGB with the tint color while
+    // preserving the alpha (= use the original image as an opacity
+    // mask). Anti-aliased pixels (alpha 1..254) blend smoothly.
+    const unsigned char tintR = (unsigned char)((tintRgb >> 16) & 0xFF);
+    const unsigned char tintG = (unsigned char)((tintRgb >>  8) & 0xFF);
+    const unsigned char tintB = (unsigned char)( tintRgb        & 0xFF);
     for (int y = 0; y < h; ++y) {
         unsigned char* src = px + y * w * 4;
         unsigned char* dst = (unsigned char*)lr.pBits + y * lr.Pitch;
         for (int x = 0; x < w; ++x) {
-            dst[x*4 + 0] = src[x*4 + 2];   // B
-            dst[x*4 + 1] = src[x*4 + 1];   // G
-            dst[x*4 + 2] = src[x*4 + 0];   // R
-            dst[x*4 + 3] = src[x*4 + 3];   // A
+            unsigned char a = src[x*4 + 3];
+            if (tintRgb != 0) {
+                dst[x*4 + 0] = tintB;
+                dst[x*4 + 1] = tintG;
+                dst[x*4 + 2] = tintR;
+            } else {
+                dst[x*4 + 0] = src[x*4 + 2];   // B
+                dst[x*4 + 1] = src[x*4 + 1];   // G
+                dst[x*4 + 2] = src[x*4 + 0];   // R
+            }
+            dst[x*4 + 3] = a;
         }
     }
     tex->UnlockRect(0);
@@ -584,10 +602,10 @@ void DrawMinimized() {
         const float pad = 8.0f;
         ImVec2 imgP0(p0.x + pad, p0.y + pad);
         ImVec2 imgP1(p1.x - pad, p1.y - pad);
-        // Tint: dim gold normally, brighter on hover.
+        // Texture pre-tinted to white; runtime tint applies gold.
         ImU32 tint = hovered
-            ? IM_COL32(0xff, 0xd6, 0x60, 0xff)
-            : IM_COL32(0xd4, 0xaf, 0x37, 0xff);
+            ? IM_COL32(0xff, 0xd6, 0x60, 0xff)   // bright gold
+            : IM_COL32(0xd4, 0xaf, 0x37, 0xff);  // dim gold
         dl->AddImage(reinterpret_cast<ImTextureID>(g_micTexture),
             imgP0, imgP1, ImVec2(0, 0), ImVec2(1, 1), tint);
     } else {
@@ -609,40 +627,49 @@ void DrawPanel() {
 
     OverlayState st = SnapshotOverlayState();
 
-    // Real ImGui window — title bar is back so the user can drag it
-    // around. Built-in collapse is disabled (NoCollapse): we use our
-    // own minimize button that goes to a separate icon window.
-    ImGui::SetNextWindowSize(ImVec2(320, 430), ImGuiCond_FirstUseEver);
+    // Fixed-size window so the user can't accidentally resize it.
+    // Title bar enabled (= draggable, shows connection status), no
+    // collapse triangle, no resize grip. A custom menu bar below the
+    // title hosts the minimize "_" button.
+    ImGui::SetNextWindowSize(ImVec2(320, 410), ImGuiCond_Always);
     char titleBuf[64];
     _snprintf_s(titleBuf, sizeof(titleBuf), _TRUNCATE,
         "l2voice  %s###l2voice_window",
         st.ws_connected ? "[connected]" : "[offline]");
-    if (!ImGui::Begin(titleBuf, nullptr, ImGuiWindowFlags_NoCollapse)) {
+    ImGuiWindowFlags wflags = ImGuiWindowFlags_NoCollapse
+                            | ImGuiWindowFlags_NoResize
+                            | ImGuiWindowFlags_MenuBar;
+    if (!ImGui::Begin(titleBuf, nullptr, wflags)) {
         ImGui::End();
         return;
     }
 
-    // Custom minimize button — right-aligned on its own row before the
-    // tabs. Click → render as a 56x56 icon next frame. Use "_" since
-    // the default ImGui font ships only ASCII (em-dash renders as "?").
-    float btnW = ImGui::CalcTextSize("_").x + 16.0f;
-    ImGui::SetCursorPosX(ImGui::GetWindowWidth() - btnW - 6.0f);
-    if (ImGui::SmallButton(" _ ##min")) {
-        g_minimized.store(true);
+    // Menu bar = the row immediately under the title bar. Right-aligned
+    // minimize button so it visually anchors to the title corner.
+    if (ImGui::BeginMenuBar()) {
+        float btnW = ImGui::CalcTextSize(" _ ").x + 16.0f;
+        float avail = ImGui::GetContentRegionAvail().x;
+        if (avail > btnW) ImGui::Dummy(ImVec2(avail - btnW, 0));
+        if (ImGui::SmallButton(" _ ##min")) {
+            g_minimized.store(true);
+        }
+        ImGui::EndMenuBar();
     }
 
-    // ====== Session + player name (header info area) ======
-    // For "player" we show the CHARACTER NAME, queried via the same
-    // sid → name machinery used for other speakers. Looking up our
-    // own session id resolves to our own player on the server side.
-    ImGui::TextDisabled("session");
-    ImGui::SameLine(ImGui::GetWindowWidth() - 72);
+    // ====== Session + player name ======
+    // Both rows right-anchor their chip to the same X so the values
+    // line up visually regardless of the chip text width.
+    const float chipColumnW = 120.0f;  // reserved width for the chip area
+    const float chipX = ImGui::GetWindowWidth() - chipColumnW - 8.0f;
+
     char sidLabel[24];
     _snprintf_s(sidLabel, sizeof(sidLabel), _TRUNCATE, "sid %u", st.session_id);
+    ImGui::TextDisabled("session");
+    ImGui::SameLine(chipX);
     Chip(sidLabel);
 
     ImGui::TextDisabled("player");
-    ImGui::SameLine(ImGui::GetWindowWidth() - 130);
+    ImGui::SameLine(chipX);
     char myName[48];
     bool haveMyName = GetSpeakerName(st.session_id, myName, sizeof(myName));
     if (haveMyName && myName[0]) {
@@ -678,7 +705,7 @@ void DrawPanel() {
     }
 
     ImGui::Separator();
-    ImGui::TextDisabled("Insert hides  ·  _ minimizes  ·  drag titlebar to move");
+    ImGui::TextDisabled("Insert hides");
     ImGui::End();
 }
 
@@ -776,10 +803,16 @@ HRESULT WINAPI HookEndScene(IDirect3DDevice9* dev) {
                               reinterpret_cast<LONG_PTR>(&HookedWndProc)));
 
         // Load the microphone icon for the minimized state. Lives next
-        // to l2voice.dll. Falls back to text if missing.
+        // to l2voice.dll. Pre-tinted to bright gold (#d4af37) at load
+        // because the source PNG is solid black + alpha — sampling it
+        // with an ImGui tint would still produce black (0×gold=0).
         wchar_t iconPath[MAX_PATH];
         ResolveDllRelativePath(L"voice-recorder.png", iconPath, MAX_PATH);
-        g_micTexture = LoadPngAsTexture(dev, iconPath, g_micW, g_micH);
+        // Pre-tint to WHITE — runtime tint then colors it (gold base,
+        // brighter gold on hover). White × tint = tint, so the
+        // runtime tint is the displayed color.
+        g_micTexture = LoadPngAsTexture(dev, iconPath,
+            g_micW, g_micH, /*tintRgb*/ 0xFFFFFF);
         if (g_micTexture) {
             Logf("[l2voice] icon loaded: %dx%d\n", g_micW, g_micH);
         } else {
