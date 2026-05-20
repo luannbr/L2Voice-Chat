@@ -46,8 +46,31 @@ HWND            g_targetHwnd   = nullptr;
 ImGuiContext*   g_imguiCtx     = nullptr;
 std::atomic<bool> g_imguiBackendInit{false};
 std::atomic<bool> g_visible{true};
+std::atomic<bool> g_imguiCapturesMouse{false};  // sampled each frame; read by GetAsyncKeyState hook
 int             g_toggleVk      = VK_INSERT;
 std::atomic<bool> g_captureNextKey{false};
+
+// GetAsyncKeyState hook — when ImGui's panel has the mouse focus,
+// return 0 for the mouse-button VKs so L2's polling-based input
+// (DirectInput-style: check GetAsyncKeyState every frame and act on
+// the click) doesn't see the click that's meant for our UI.
+using PFN_GetAsyncKeyState = SHORT (WINAPI*)(int);
+PFN_GetAsyncKeyState g_origGetAsyncKeyState = nullptr;
+
+SHORT WINAPI HookGetAsyncKeyState(int vk) {
+    if (g_imguiCapturesMouse.load(std::memory_order_relaxed)) {
+        switch (vk) {
+            case VK_LBUTTON:
+            case VK_RBUTTON:
+            case VK_MBUTTON:
+            case VK_XBUTTON1:
+            case VK_XBUTTON2:
+                return 0;
+        }
+    }
+    if (g_origGetAsyncKeyState) return g_origGetAsyncKeyState(vk);
+    return 0;
+}
 
 // =============================================================
 // Helpers
@@ -89,57 +112,68 @@ void VkToString(int vk, char* out, size_t cap) {
     _snprintf_s(out, cap, _TRUNCATE, "vk=%d", vk);
 }
 
-void ApplyDarkGlassStyle() {
+// L2 Gothic palette — sepia background, gold borders, parchment text.
+// Mirrors the L2 in-game menu look (cf. inventory/system menu).
+void ApplyL2GothicStyle() {
     ImGuiStyle& s = ImGui::GetStyle();
-    s.WindowRounding   = 8.0f;
-    s.FrameRounding    = 6.0f;
-    s.GrabRounding     = 6.0f;
+    s.WindowRounding   = 3.0f;
+    s.FrameRounding    = 2.0f;
+    s.GrabRounding     = 2.0f;
+    s.TabRounding      = 2.0f;
     s.WindowPadding    = ImVec2(12, 10);
     s.ItemSpacing      = ImVec2(8, 6);
     s.WindowBorderSize = 1.0f;
     s.FrameBorderSize  = 0.0f;
-    s.TabRounding      = 6.0f;
 
-    ImVec4 bg     = ImVec4(20/255.f, 22/255.f, 30/255.f, 0.92f);
-    ImVec4 border = ImVec4(1,1,1, 0.08f);
-    ImVec4 text   = ImVec4(232/255.f, 234/255.f, 240/255.f, 1.0f);
-    ImVec4 textD  = ImVec4(139/255.f, 146/255.f, 163/255.f, 1.0f);
-    ImVec4 accent = ImVec4(129/255.f, 140/255.f, 248/255.f, 1.0f);
-    ImVec4 accentBg     = ImVec4(129/255.f, 140/255.f, 248/255.f, 0.15f);
-    ImVec4 accentHover  = ImVec4(129/255.f, 140/255.f, 248/255.f, 0.25f);
+    // Palette
+    ImVec4 bg          = ImVec4(0x1a/255.f, 0x14/255.f, 0x10/255.f, 0.94f);
+    ImVec4 bgFrame     = ImVec4(0x0d/255.f, 0x0a/255.f, 0x08/255.f, 1.00f);
+    ImVec4 border      = ImVec4(0x8b/255.f, 0x69/255.f, 0x14/255.f, 1.00f);
+    ImVec4 borderDim   = ImVec4(0x5a/255.f, 0x44/255.f, 0x10/255.f, 1.00f);
+    ImVec4 text        = ImVec4(0xe8/255.f, 0xd4/255.f, 0xa0/255.f, 1.00f);
+    ImVec4 textDim     = ImVec4(0xa8/255.f, 0x90/255.f, 0x60/255.f, 1.00f);
+    ImVec4 accent      = ImVec4(0xd4/255.f, 0xaf/255.f, 0x37/255.f, 1.00f);
+    ImVec4 accentBg    = ImVec4(0xd4/255.f, 0xaf/255.f, 0x37/255.f, 0.20f);
+    ImVec4 accentHover = ImVec4(0xd4/255.f, 0xaf/255.f, 0x37/255.f, 0.35f);
+    ImVec4 titleBg     = ImVec4(0x2a/255.f, 0x1f/255.f, 0x15/255.f, 1.00f);
 
     ImVec4* c = s.Colors;
     c[ImGuiCol_WindowBg]              = bg;
     c[ImGuiCol_ChildBg]               = ImVec4(0,0,0,0);
     c[ImGuiCol_Border]                = border;
+    c[ImGuiCol_BorderShadow]          = ImVec4(0,0,0,0);
     c[ImGuiCol_Text]                  = text;
-    c[ImGuiCol_TextDisabled]          = textD;
-    c[ImGuiCol_FrameBg]               = ImVec4(1,1,1, 0.06f);
-    c[ImGuiCol_FrameBgHovered]        = ImVec4(1,1,1, 0.08f);
-    c[ImGuiCol_FrameBgActive]         = ImVec4(1,1,1, 0.10f);
-    c[ImGuiCol_TitleBg]               = bg;
-    c[ImGuiCol_TitleBgActive]         = bg;
-    c[ImGuiCol_TitleBgCollapsed]      = bg;
+    c[ImGuiCol_TextDisabled]          = textDim;
+    c[ImGuiCol_FrameBg]               = bgFrame;
+    c[ImGuiCol_FrameBgHovered]        = ImVec4(0x2a/255.f, 0x1f/255.f, 0x15/255.f, 1.0f);
+    c[ImGuiCol_FrameBgActive]         = ImVec4(0x3a/255.f, 0x2a/255.f, 0x1c/255.f, 1.0f);
+    c[ImGuiCol_TitleBg]               = titleBg;
+    c[ImGuiCol_TitleBgActive]         = titleBg;
+    c[ImGuiCol_TitleBgCollapsed]      = titleBg;
     c[ImGuiCol_Button]                = accentBg;
     c[ImGuiCol_ButtonHovered]         = accentHover;
     c[ImGuiCol_ButtonActive]          = accent;
     c[ImGuiCol_SliderGrab]            = accent;
     c[ImGuiCol_SliderGrabActive]      = accent;
     c[ImGuiCol_CheckMark]             = accent;
-    c[ImGuiCol_Separator]             = border;
+    c[ImGuiCol_Separator]             = borderDim;
     c[ImGuiCol_SeparatorHovered]      = accentHover;
     c[ImGuiCol_SeparatorActive]       = accent;
     c[ImGuiCol_ResizeGrip]            = ImVec4(0,0,0,0);
     c[ImGuiCol_ResizeGripHovered]     = accentHover;
     c[ImGuiCol_ResizeGripActive]      = accent;
     c[ImGuiCol_ScrollbarBg]           = ImVec4(0,0,0,0);
-    c[ImGuiCol_ScrollbarGrab]         = ImVec4(1,1,1,0.1f);
-    c[ImGuiCol_ScrollbarGrabHovered]  = ImVec4(1,1,1,0.15f);
-    c[ImGuiCol_Tab]                   = ImVec4(1,1,1, 0.04f);
+    c[ImGuiCol_ScrollbarGrab]         = ImVec4(0x8b/255.f, 0x69/255.f, 0x14/255.f, 0.3f);
+    c[ImGuiCol_ScrollbarGrabHovered]  = ImVec4(0x8b/255.f, 0x69/255.f, 0x14/255.f, 0.5f);
+    c[ImGuiCol_ScrollbarGrabActive]   = accent;
+    c[ImGuiCol_Tab]                   = ImVec4(0x2a/255.f, 0x1f/255.f, 0x15/255.f, 1.0f);
     c[ImGuiCol_TabHovered]            = accentHover;
     c[ImGuiCol_TabActive]             = accentBg;
-    c[ImGuiCol_TabUnfocused]          = ImVec4(1,1,1, 0.02f);
+    c[ImGuiCol_TabUnfocused]          = ImVec4(0x1a/255.f, 0x14/255.f, 0x10/255.f, 1.0f);
     c[ImGuiCol_TabUnfocusedActive]    = accentBg;
+    c[ImGuiCol_Header]                = accentBg;
+    c[ImGuiCol_HeaderHovered]         = accentHover;
+    c[ImGuiCol_HeaderActive]          = accent;
 }
 
 void Chip(const char* text,
@@ -457,7 +491,7 @@ HRESULT WINAPI HookEndScene(IDirect3DDevice9* dev) {
         // the Win32 backend's NewFrame to never call ::SetCursor.
         io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
 
-        ApplyDarkGlassStyle();
+        ApplyL2GothicStyle();
 
         g_origWndProc = reinterpret_cast<WNDPROC>(
             SetWindowLongPtrW(hwnd, GWLP_WNDPROC,
@@ -480,6 +514,12 @@ HRESULT WINAPI HookEndScene(IDirect3DDevice9* dev) {
         ImGui::EndFrame();
         ImGui::Render();
         ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
+        // Sample WantCaptureMouse for the GetAsyncKeyState hook so it
+        // knows whether to mask clicks from the game's input polling.
+        g_imguiCapturesMouse.store(
+            ImGui::GetIO().WantCaptureMouse, std::memory_order_relaxed);
+    } else {
+        g_imguiCapturesMouse.store(false, std::memory_order_relaxed);
     }
 
     return g_origEndScene(dev);
@@ -543,14 +583,33 @@ bool InstallOverlay() {
         Logf("[l2voice] overlay: MH_Initialize failed: %d\n", s);
         return false;
     }
+    // Also hook GetAsyncKeyState in user32 so the game's polling
+    // input loop (typical for L2: GetAsyncKeyState(VK_LBUTTON) every
+    // tick to detect clicks) reports "no click" while the panel has
+    // the mouse. Pure WndProc consume isn't enough — the kernel
+    // still tracks the physical button state, and GetAsyncKeyState
+    // reads from there, bypassing message processing.
+    HMODULE user32 = GetModuleHandleA("user32.dll");
+    void* gaksAddr = user32 ? GetProcAddress(user32, "GetAsyncKeyState") : nullptr;
+
     if (MH_CreateHook(endSceneAddr,
             reinterpret_cast<void*>(&HookEndScene),
             reinterpret_cast<void**>(&g_origEndScene)) != MH_OK ||
         MH_CreateHook(resetAddr,
             reinterpret_cast<void*>(&HookReset),
-            reinterpret_cast<void**>(&g_origReset)) != MH_OK ||
-        MH_EnableHook(MH_ALL_HOOKS) != MH_OK) {
-        Logf("[l2voice] overlay: hook install failed\n");
+            reinterpret_cast<void**>(&g_origReset)) != MH_OK) {
+        Logf("[l2voice] overlay: D3D9 hook install failed\n");
+        return false;
+    }
+    if (gaksAddr) {
+        if (MH_CreateHook(gaksAddr,
+                reinterpret_cast<void*>(&HookGetAsyncKeyState),
+                reinterpret_cast<void**>(&g_origGetAsyncKeyState)) != MH_OK) {
+            Logf("[l2voice] overlay: GetAsyncKeyState hook install failed\n");
+        }
+    }
+    if (MH_EnableHook(MH_ALL_HOOKS) != MH_OK) {
+        Logf("[l2voice] overlay: MH_EnableHook(ALL) failed\n");
         return false;
     }
 
