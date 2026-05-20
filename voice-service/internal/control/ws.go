@@ -102,59 +102,55 @@ func handleWS(ctx context.Context, w http.ResponseWriter, r *http.Request, state
 	defer conn.Close()
 	log.Printf("control: %s connected (UA=%q)", r.RemoteAddr, r.Header.Get("User-Agent"))
 
-	// Read auth messages until one resolves to a real player_id. The
-	// DLL connects to the WS the moment l2voice.dll loads and starts
-	// sending auth messages immediately, but it only carries the
-	// L2-to-GS source port once the user has clicked "Enter World"
-	// and the GS socket appears in the process's TCP table. Until
-	// then `/voice/whoami` returns 0. We don't close the WS on those
-	// early rejects — that would force IXWebSocket into a multi-
-	// second reconnect cycle and make first-audio-after-EnterWorld
-	// feel laggy. Instead, we reply auth_pending and wait for the
-	// next auth message (the DLL re-sends whenever its port list
-	// changes).
+	// First read the auth msg (with the candidate ports). The DLL
+	// sends this once on WS Open. We then drive the whoami resolution
+	// server-side, retrying on a timer until the player_id resolves
+	// or the auth window (5 min) expires. This avoids needing the
+	// DLL to re-send on auth_pending — most DLL builds won't, since
+	// their port list is stable from "Login" click onward.
 	clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
 	authDeadline := time.Now().Add(5 * time.Minute)
+	conn.SetReadDeadline(authDeadline)
+	_, raw, err := conn.ReadMessage()
+	if err != nil {
+		log.Printf("control: %s read auth failed: %v", r.RemoteAddr, err)
+		return
+	}
+	var msg authMsg
+	if err := json.Unmarshal(raw, &msg); err != nil || msg.Type != "auth" {
+		_ = conn.WriteJSON(authFail{Type: "auth_fail", Reason: "bad_auth_msg"})
+		return
+	}
+	if len(msg.Ports) == 0 {
+		_ = conn.WriteJSON(authFail{Type: "auth_fail", Reason: "no_ports"})
+		return
+	}
+	log.Printf("control: %s auth ports=%v clientIP=%q (resolving...)",
+		r.RemoteAddr, msg.Ports, clientIP)
+
+	// Now poll the bridge until it resolves the player.
 	var playerID uint32
 	for {
 		if time.Now().After(authDeadline) {
-			log.Printf("control: %s auth window exhausted (no player resolved in 5min)", r.RemoteAddr)
+			log.Printf("control: %s auth window exhausted (5 min)", r.RemoteAddr)
 			_ = conn.WriteJSON(authFail{Type: "auth_fail", Reason: "auth_timeout"})
 			return
 		}
-		conn.SetReadDeadline(authDeadline)
-		_, raw, err := conn.ReadMessage()
-		if err != nil {
-			log.Printf("control: %s read auth failed: %v", r.RemoteAddr, err)
-			return
-		}
-		var msg authMsg
-		if err := json.Unmarshal(raw, &msg); err != nil || msg.Type != "auth" {
-			_ = conn.WriteJSON(authFail{Type: "auth_fail", Reason: "bad_auth_msg"})
-			continue
-		}
-		if len(msg.Ports) == 0 {
-			_ = conn.WriteJSON(authFail{Type: "auth_pending", Reason: "no_ports_yet"})
-			continue
-		}
 		pid, lookupErr := whoamiLookup(clientIP, msg.Ports)
-		if lookupErr != nil {
-			log.Printf("control: /voice/whoami error for %s: %v", r.RemoteAddr, lookupErr)
-			_ = conn.WriteJSON(authFail{Type: "auth_pending", Reason: "whoami_error"})
-			continue
+		if lookupErr == nil && pid != 0 {
+			playerID = pid
+			break
 		}
-		if pid == 0 {
-			// Probably the DLL is up but the user hasn't clicked into
-			// the world yet. Reply auth_pending and keep waiting for
-			// the next auth msg from the DLL.
-			log.Printf("control: %s auth pending — ports=%v unresolved", r.RemoteAddr, msg.Ports)
-			_ = conn.WriteJSON(authFail{Type: "auth_pending", Reason: "player_not_in_world"})
-			continue
+		// Sleep before retrying. Cheap: one HTTP call to bridge per
+		// pending client every 2 s, only while not-yet-resolved.
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(2 * time.Second):
 		}
-		playerID = pid
-		log.Printf("control: %s auth resolved player=%d (ports=%v)", r.RemoteAddr, playerID, msg.Ports)
-		break
 	}
+	log.Printf("control: %s auth resolved player=%d (ports=%v)",
+		r.RemoteAddr, playerID, msg.Ports)
 
 	sess := state.AllocSession(playerID)
 	defer state.Drop(sess.ID)
