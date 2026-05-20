@@ -641,11 +641,12 @@ void DrawPanel() {
     }
 
     // ---- Minimize button drawn DIRECTLY on the title bar ----
-    // ImGui doesn't expose a "custom title-bar button" API. We draw
-    // it ourselves: use the FOREGROUND drawlist (no per-window clip
-    // rect — GetWindowDrawList clips to the content area below the
-    // title bar, so anything drawn at title-bar Y disappears).
-    // Hit-test the rectangle manually with IsMouseHoveringRect.
+    // Use an InvisibleButton positioned via SetCursorScreenPos at the
+    // title-bar's right corner. InvisibleButton is a real ImGui item,
+    // so the window-drag system skips its rectangle and our
+    // IsItemClicked fires reliably. Visual (background + border + "_")
+    // is drawn on the FOREGROUND drawlist so it isn't clipped by the
+    // window content area (GetWindowDrawList would have clipped it).
     {
         ImGuiStyle& s = ImGui::GetStyle();
         const float titleH = ImGui::GetFontSize() + s.FramePadding.y * 2;
@@ -654,10 +655,16 @@ void DrawPanel() {
         const float btnSz = titleH - 4;
         ImVec2 btnMin(winP.x + winW - btnSz - 6, winP.y + 2);
         ImVec2 btnMax(btnMin.x + btnSz, btnMin.y + btnSz);
-        bool hovered = ImGui::IsMouseHoveringRect(btnMin, btnMax);
-        if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+
+        // Save cursor so the rest of the body lays out normally after.
+        ImVec2 savedCursor = ImGui::GetCursorScreenPos();
+        ImGui::SetCursorScreenPos(btnMin);
+        ImGui::InvisibleButton("##title_min", ImVec2(btnSz, btnSz));
+        bool hovered = ImGui::IsItemHovered();
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
             g_minimized.store(true);
         }
+        ImGui::SetCursorScreenPos(savedCursor);
 
         ImDrawList* dl = ImGui::GetForegroundDrawList();
         ImU32 bg = hovered
@@ -669,9 +676,8 @@ void DrawPanel() {
         ImU32 fg = hovered
             ? IM_COL32(0xff, 0xd6, 0x60, 0xff)
             : IM_COL32(0xd4, 0xaf, 0x37, 0xff);
-        // "_" drawn as a horizontal gold line at the bottom of the box
-        // (a real underscore glyph baseline-floats too low at the
-        // title-bar height).
+        // "_" — manual gold line at the bottom of the box (underscore
+        // glyph would baseline-float too low).
         float midY = btnMax.y - 4;
         dl->AddLine(ImVec2(btnMin.x + 4, midY),
                     ImVec2(btnMax.x - 4, midY), fg, 2.0f);
