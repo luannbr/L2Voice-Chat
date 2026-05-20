@@ -36,6 +36,9 @@ namespace {
 struct Mod {
     Config cfg{};
     std::atomic<bool> running{false};
+    // Path to voice.ini next to the DLL — captured at Init so the
+    // setters can write changes back without re-resolving each time.
+    wchar_t ini_path[MAX_PATH] = {};
 
     std::atomic<uint16_t> tx_seq{0};
 
@@ -169,6 +172,7 @@ Config DefaultConfig() {
     c.auto_connect  = true;
     c.require_focus = true;
     c.always_on     = false;
+    c.master_volume = 1.0f;
     return c;
 }
 
@@ -233,11 +237,28 @@ bool LoadConfigFromIni(const wchar_t* path, Config* out) {
     c.auto_connect   = getI(L"auto_connect", 1) != 0;
     c.require_focus  = getI(L"require_focus", 1) != 0;
     c.always_on      = getI(L"always_on", 0) != 0;
+    c.master_volume  = (float)getI(L"master_volume", 100) / 100.0f;
     *out = c;
     return true;
 }
 
 void RefreshClientPorts();   // fwd decl
+
+// Used by dllmain.cpp to tell us where voice.ini lives (so the
+// overlay setters can persist changes). Call once before Init.
+void SetIniPath(const wchar_t* path) {
+    if (!path) { g_mod.ini_path[0] = 0; return; }
+    wcsncpy_s(g_mod.ini_path, MAX_PATH, path, MAX_PATH - 1);
+}
+
+// Writes an integer key to [voice] in voice.ini. Cheap: WinAPI does
+// the parse/replace/write internally.
+static void IniWriteInt(const wchar_t* key, int value) {
+    if (g_mod.ini_path[0] == 0) return;
+    wchar_t buf[32];
+    swprintf_s(buf, L"%d", value);
+    WritePrivateProfileStringW(L"voice", key, buf, g_mod.ini_path);
+}
 
 bool Init(const Config& cfg) {
     if (g_mod.running.load()) return true;
@@ -247,6 +268,7 @@ bool Init(const Config& cfg) {
 
     if (!g_mod.encoder.Init())                       return false;
     if (!g_mod.playback.Start(cfg.playback_device))  return false;
+    g_mod.playback.SetMasterVolume(cfg.master_volume);
 
     if (!g_mod.capture.Start(cfg.capture_device, &OnCaptureFrame)) {
         g_mod.playback.Stop();
@@ -330,10 +352,24 @@ OverlayState SnapshotOverlayState() {
     return s;
 }
 
-void SetRequireFocus(bool v)    { g_mod.cfg.require_focus = v; }
-void SetAlwaysOn(bool v)        { g_mod.cfg.always_on     = v; }
-void SetPttProximityVk(int vk)  { g_mod.cfg.ptt_proximity = vk; }
-void SetMasterVolume(float g)   { g_mod.playback.SetMasterVolume(g); }
+// Setters persist to voice.ini so the user's preferences survive
+// the next L2 launch. Master volume is stored as a percent (0..200).
+void SetRequireFocus(bool v) {
+    g_mod.cfg.require_focus = v;
+    IniWriteInt(L"require_focus", v ? 1 : 0);
+}
+void SetAlwaysOn(bool v) {
+    g_mod.cfg.always_on = v;
+    IniWriteInt(L"always_on", v ? 1 : 0);
+}
+void SetPttProximityVk(int vk) {
+    g_mod.cfg.ptt_proximity = vk;
+    IniWriteInt(L"ptt_proximity", vk);
+}
+void SetMasterVolume(float g) {
+    g_mod.playback.SetMasterVolume(g);
+    IniWriteInt(L"master_volume", (int)(g * 100.0f + 0.5f));
+}
 void GetSpeakerList(SpeakerInfo* out, size_t cap, size_t& count) {
     g_mod.playback.GetSpeakerInfos(out, cap, count);
 }

@@ -43,12 +43,9 @@ EndScene_t      g_origEndScene = nullptr;
 Reset_t         g_origReset    = nullptr;
 WNDPROC         g_origWndProc  = nullptr;
 HWND            g_targetHwnd   = nullptr;
-HHOOK           g_mouseHook    = nullptr;
 ImGuiContext*   g_imguiCtx     = nullptr;
 std::atomic<bool> g_imguiBackendInit{false};
 std::atomic<bool> g_visible{true};
-std::atomic<bool> g_minimized{false};
-std::atomic<bool> g_imguiWantsMouse{false};   // sampled each frame; read by low-level hook
 int             g_toggleVk      = VK_INSERT;
 std::atomic<bool> g_captureNextKey{false};
 
@@ -170,32 +167,6 @@ void DrawConnectionDot(bool ok) {
     }
     ImGui::Dummy(ImVec2(12, 0));
     ImGui::SameLine();
-}
-
-// =============================================================
-// Minimized state
-// =============================================================
-
-void DrawMinimized() {
-    ImGui::SetNextWindowSize(ImVec2(48, 48), ImGuiCond_Always);
-    ImGui::SetNextWindowBgAlpha(0.85f);
-    ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar
-                           | ImGuiWindowFlags_NoResize
-                           | ImGuiWindowFlags_NoScrollbar
-                           | ImGuiWindowFlags_NoCollapse;
-    if (!ImGui::Begin("##l2voice_min", nullptr, flags)) {
-        ImGui::End();
-        return;
-    }
-    ImGui::SetCursorPos(ImVec2(10, 10));
-    ImGui::PushStyleColor(ImGuiCol_Text,
-        ImVec4(129/255.f, 140/255.f, 248/255.f, 1.0f));
-    ImGui::TextUnformatted("VOX");
-    ImGui::PopStyleColor();
-    if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-        g_minimized.store(false);
-    }
-    ImGui::End();
 }
 
 // =============================================================
@@ -321,49 +292,32 @@ void DrawComingSoon(const char* channelName) {
 // Main panel
 // =============================================================
 
-void DrawPanel() {
-    if (!g_visible.load(std::memory_order_relaxed)) return;
-
+// Returns true if a frame should be drawn this tick. When false, the
+// caller MUST skip ImGui_ImplWin32_NewFrame entirely — that backend
+// otherwise calls SetCursor every frame, fighting the L2 game's own
+// cursor management and flickering badly. (Pattern lifted from the
+// existing l2ui DLL where we already hit and fixed this same bug.)
+bool ShouldDrawFrame() {
+    if (!g_visible.load(std::memory_order_relaxed)) return false;
     OverlayState st = SnapshotOverlayState();
-    if (st.session_id == 0) {
-        g_imguiWantsMouse.store(false);
-        return;
-    }
+    return st.session_id != 0;
+}
 
-    if (g_minimized.load()) {
-        DrawMinimized();
-        g_imguiWantsMouse.store(ImGui::GetIO().WantCaptureMouse);
-        return;
-    }
+void DrawPanel() {
+    OverlayState st = SnapshotOverlayState();
 
+    // Real ImGui window — title bar is back so the user can drag it
+    // around and ImGui's built-in title-bar collapse triangle acts
+    // as our minimize button. Window dragging and collapse are free.
     ImGui::SetNextWindowSize(ImVec2(320, 430), ImGuiCond_FirstUseEver);
-    ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse
-                           | ImGuiWindowFlags_NoTitleBar;
-    if (!ImGui::Begin("##l2voice", nullptr, flags)) {
+    char titleBuf[64];
+    _snprintf_s(titleBuf, sizeof(titleBuf), _TRUNCATE,
+        "l2voice  %s ###l2voice_window",
+        st.ws_connected ? "[connected]" : "[offline]");
+    if (!ImGui::Begin(titleBuf)) {
         ImGui::End();
-        g_imguiWantsMouse.store(false);
         return;
     }
-
-    // ====== Header (3-column layout: title | spacer | controls) ======
-    // Render controls right-to-left from the window's right edge so
-    // the minimize button is always visible regardless of text width.
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1,1,1, 1.0f));
-    ImGui::TextUnformatted("l2voice");
-    ImGui::PopStyleColor();
-
-    // Right-anchor block: [ minimize ] [ status ] [ dot ]
-    const char* statusText = st.ws_connected ? "connected" : "offline";
-    float minBtnW    = ImGui::CalcTextSize("_").x  + 18.0f;
-    float statusW    = ImGui::CalcTextSize(statusText).x + 6.0f;
-    float dotW       = 14.0f;
-    float headerW    = minBtnW + statusW + dotW + 12.0f;
-    ImGui::SameLine(ImGui::GetWindowWidth() - headerW - 8.0f);
-    DrawConnectionDot(st.ws_connected);
-    ImGui::TextDisabled("%s", statusText);
-    ImGui::SameLine();
-    if (ImGui::SmallButton("_##min")) g_minimized.store(true);
-    ImGui::Separator();
 
     // ====== Session + player name (header info area) ======
     // For "player" we show the CHARACTER NAME, queried via the same
@@ -412,44 +366,8 @@ void DrawPanel() {
     }
 
     ImGui::Separator();
-    ImGui::TextDisabled("Insert to hide  ·  _ to minimize");
-
-    // Snapshot WantCaptureMouse for the low-level hook (read on
-    // another thread without grabbing the ImGui context).
-    g_imguiWantsMouse.store(ImGui::GetIO().WantCaptureMouse);
-
+    ImGui::TextDisabled("Insert hides  ·  click triangle to collapse");
     ImGui::End();
-}
-
-// =============================================================
-// Low-level mouse hook: blocks mouse input from reaching L2 (via
-// DirectInput etc.) when ImGui is the intended consumer.
-// =============================================================
-
-LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wp, LPARAM lp) {
-    if (nCode != HC_ACTION) return CallNextHookEx(nullptr, nCode, wp, lp);
-    if (!g_imguiBackendInit.load() || !g_imguiWantsMouse.load()) {
-        return CallNextHookEx(nullptr, nCode, wp, lp);
-    }
-    // Only block when the cursor is over the L2 window and the panel
-    // is the intended target. We let mouse movement through so the
-    // OS cursor still follows, but suppress button presses.
-    if (wp == WM_LBUTTONDOWN || wp == WM_LBUTTONUP ||
-        wp == WM_RBUTTONDOWN || wp == WM_RBUTTONUP ||
-        wp == WM_MBUTTONDOWN || wp == WM_MBUTTONUP ||
-        wp == WM_XBUTTONDOWN || wp == WM_XBUTTONUP ||
-        wp == WM_MOUSEWHEEL  || wp == WM_MOUSEHWHEEL) {
-        POINT pt;
-        if (GetCursorPos(&pt)) {
-            HWND under = WindowFromPoint(pt);
-            DWORD ownerPid = 0;
-            if (under) GetWindowThreadProcessId(under, &ownerPid);
-            if (ownerPid == GetCurrentProcessId()) {
-                return 1;   // swallow — game (DirectInput too) won't see it
-            }
-        }
-    }
-    return CallNextHookEx(nullptr, nCode, wp, lp);
 }
 
 // =============================================================
@@ -490,9 +408,11 @@ LRESULT CALLBACK HookedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         ImGui_ImplWin32_WndProcHandler(hwnd, msg, wp, lp);
         ImGuiIO& io = ImGui::GetIO();
 
-        if (msg == WM_SETCURSOR && io.WantCaptureMouse) {
-            ::SetCursor(::LoadCursorA(nullptr, IDC_ARROW));
-            return TRUE;
+        // Pattern from l2ui: when ImGui wants the mouse, return 1 to
+        // WM_SETCURSOR (NOT setting it ourselves). The cursor stays
+        // whatever the previous WndProc set — no fight.
+        if (io.WantCaptureMouse && msg == WM_SETCURSOR) {
+            return 1;
         }
 
         bool isMouse = (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST) ||
@@ -531,7 +451,11 @@ HRESULT WINAPI HookEndScene(IDirect3DDevice9* dev) {
 
         ImGuiIO& io = ImGui::GetIO();
         io.IniFilename = nullptr;
-        io.BackendFlags &= ~ImGuiBackendFlags_HasMouseCursors;
+        // CRITICAL: ConfigFlags (not BackendFlags) is the right knob.
+        // l2ui hit the same cursor-fight bug — see comments in their
+        // d3d9_hook.cpp around line 1303. NoMouseCursorChange tells
+        // the Win32 backend's NewFrame to never call ::SetCursor.
+        io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
 
         ApplyDarkGlassStyle();
 
@@ -539,33 +463,24 @@ HRESULT WINAPI HookEndScene(IDirect3DDevice9* dev) {
             SetWindowLongPtrW(hwnd, GWLP_WNDPROC,
                               reinterpret_cast<LONG_PTR>(&HookedWndProc)));
 
-        // Install the low-level mouse hook now that we know we're
-        // in-process and have a context. WH_MOUSE_LL is per-thread when
-        // hMod is NULL and ThreadId is 0; but it's global with a
-        // non-null hMod. We use ourselves so the callback lives in our
-        // module's address space — required for LL hooks.
-        HMODULE self = nullptr;
-        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            reinterpret_cast<LPCSTR>(&HookedWndProc), &self);
-        g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, &LowLevelMouseProc,
-            self, 0);
-        if (!g_mouseHook) {
-            Logf("[l2voice] overlay: WH_MOUSE_LL install failed (err=%lu)\n",
-                GetLastError());
-        }
-
         g_imguiBackendInit.store(true);
     }
 
     ImGui::SetCurrentContext(g_imguiCtx);
-    ImGui_ImplDX9_NewFrame();
-    ImGui_ImplWin32_NewFrame();
-    ImGui::NewFrame();
-    DrawPanel();
-    ImGui::EndFrame();
-    ImGui::Render();
-    ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
+    // CRITICAL: skip the frame entirely when the panel won't draw.
+    // ImGui_ImplWin32_NewFrame calls SetCursor every frame regardless
+    // of whether anything renders — calling it while the panel is
+    // hidden makes the cursor flicker between L2's custom cursor and
+    // the OS arrow.
+    if (ShouldDrawFrame()) {
+        ImGui_ImplDX9_NewFrame();
+        ImGui_ImplWin32_NewFrame();
+        ImGui::NewFrame();
+        DrawPanel();
+        ImGui::EndFrame();
+        ImGui::Render();
+        ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
+    }
 
     return g_origEndScene(dev);
 }
@@ -648,7 +563,6 @@ bool InstallOverlay() {
 }
 
 void UninstallOverlay() {
-    if (g_mouseHook) { UnhookWindowsHookEx(g_mouseHook); g_mouseHook = nullptr; }
     if (g_imguiBackendInit.load()) {
         ImGui::SetCurrentContext(g_imguiCtx);
         ImGui_ImplDX9_Shutdown();

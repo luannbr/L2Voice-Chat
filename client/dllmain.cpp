@@ -53,6 +53,11 @@ void InitWorker() {
     wchar_t ini_path[MAX_PATH];
     ResolveIniPath(ini_path, MAX_PATH);
 
+    // Tell the voice module where the ini lives so its setters can
+    // persist changes the user makes through the overlay (master
+    // volume slider, PTT rebind, toggles, etc.).
+    voice::SetIniPath(ini_path);
+
     voice::Config cfg;
     bool fromIni = voice::LoadConfigFromIni(ini_path, &cfg);
     if (!fromIni) {

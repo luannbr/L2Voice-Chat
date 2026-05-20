@@ -71,7 +71,14 @@ struct Config {
     // Capture gates.
     bool     require_focus;      // only transmit while L2 window has focus (default true)
     bool     always_on;          // bypass PTT — always transmit (still gated by require_focus)
+
+    // Playback.
+    float    master_volume;      // 0..2, applied per playback frame
 };
+
+// Tell the voice module where voice.ini lives so setters can write
+// changes back. Call before Init. Defined in voice.cpp.
+void SetIniPath(const wchar_t* path);
 
 Config DefaultConfig();
 bool LoadConfigFromIni(const wchar_t* path, Config* out);
