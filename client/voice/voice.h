@@ -67,6 +67,10 @@ struct Config {
     // Master flags.
     bool     enabled;            // false = module loaded but inert
     bool     auto_connect;       // try to auth WS at startup
+
+    // Capture gates.
+    bool     require_focus;      // only transmit while L2 window has focus (default true)
+    bool     always_on;          // bypass PTT — always transmit (still gated by require_focus)
 };
 
 Config DefaultConfig();

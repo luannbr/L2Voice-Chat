@@ -61,28 +61,44 @@ struct Mod {
 
 Mod g_mod;
 
+// True iff a window owned by THIS process currently has keyboard focus.
+// Used to gate microphone capture so holding the PTT key while the L2
+// window is minimized / Alt-Tab'd doesn't transmit anything.
+bool L2HasForegroundFocus() {
+    HWND fg = GetForegroundWindow();
+    if (!fg) return false;
+    DWORD fgPid = 0;
+    GetWindowThreadProcessId(fg, &fgPid);
+    return fgPid == GetCurrentProcessId();
+}
+
 void OnCaptureFrame(const int16_t* pcm, uint32_t samples) {
     if (!g_mod.running.load()) return;
     if (samples != kFrameSamples) return;
 
-    bool ptt = false;
+    bool focused = !g_mod.cfg.require_focus || L2HasForegroundFocus();
+    bool ptt_pressed = false;
     if (g_mod.cfg.ptt_proximity != 0) {
-        ptt = (GetAsyncKeyState(g_mod.cfg.ptt_proximity) & 0x8000) != 0;
+        ptt_pressed = (GetAsyncKeyState(g_mod.cfg.ptt_proximity) & 0x8000) != 0;
     }
+    // Transmit decision:
+    //   always_on  → talk whenever the L2 window is focused
+    //   PTT mode   → talk only when the L2 window is focused AND PTT is held
+    // require_focus=0 disables the focus check (useful for testing only).
+    bool transmit = focused && (g_mod.cfg.always_on || ptt_pressed);
 
-    // Diagnostic counter: every 50 frames (~1s) report state so we can
-    // see capture + PTT + ws state from DebugView.
     static uint32_t cap_frames = 0;
     if ((++cap_frames % 50) == 0) {
-        char dbg[160];
+        char dbg[200];
         _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-            "[l2voice] capture=%u ptt=%d ws_connected=%d sid=%u\n",
-            cap_frames, ptt ? 1 : 0,
+            "[l2voice] capture=%u tx=%d focus=%d ptt=%d on=%d ws=%d sid=%u\n",
+            cap_frames, transmit ? 1 : 0, focused ? 1 : 0,
+            ptt_pressed ? 1 : 0, g_mod.cfg.always_on ? 1 : 0,
             g_mod.net.IsConnected() ? 1 : 0, g_mod.net.SessionID());
         OutputDebugStringA(dbg);
     }
 
-    if (!ptt) return;
+    if (!transmit) return;
     if (!g_mod.net.IsConnected()) return;
 
     uint8_t opus_buf[kMaxPacketBytes];
@@ -145,8 +161,11 @@ Config DefaultConfig() {
     c.ptt_ally      = 'M';
     c.enabled       = true;
     c.auto_connect  = true;
+    c.require_focus = true;
+    c.always_on     = false;
     return c;
 }
+
 
 // Enumerates this process's owned TCP connections and returns the local
 // (source) ports. The bridge will match these against L2GameClient
@@ -206,6 +225,8 @@ bool LoadConfigFromIni(const wchar_t* path, Config* out) {
     c.ptt_ally       = getI(L"ptt_ally",       c.ptt_ally);
     c.enabled        = getI(L"enabled", 1) != 0;
     c.auto_connect   = getI(L"auto_connect", 1) != 0;
+    c.require_focus  = getI(L"require_focus", 1) != 0;
+    c.always_on      = getI(L"always_on", 0) != 0;
     *out = c;
     return true;
 }
