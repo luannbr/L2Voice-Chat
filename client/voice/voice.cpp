@@ -10,6 +10,7 @@
 #include "voice.h"
 #include "audio_io.h"
 #include "opus_codec.h"
+#include "overlay.h"
 #include "voice_network.h"
 
 #include <winsock2.h>      // must precede iphlpapi.h
@@ -261,6 +262,13 @@ bool Init(const Config& cfg) {
 
     g_mod.running.store(true);
 
+    // Install the in-game overlay (D3D9 EndScene hook + ImGui panel).
+    // Logs progress to OutputDebugString — failures are non-fatal,
+    // the audio pipeline still works without the UI.
+    if (!InstallOverlay()) {
+        OutputDebugStringA("[l2voice] overlay install failed; continuing without UI\n");
+    }
+
     // Keepalive thread: every 5s the DLL emits a UDP header-only
     // packet so the voice-service learns (and refreshes) our UDP
     // source address. WITHOUT this, the service only knows the UDP
@@ -295,6 +303,7 @@ void RefreshClientPorts() {
 
 void Shutdown() {
     if (!g_mod.running.exchange(false)) return;
+    UninstallOverlay();
     if (g_mod.keepalive_thread.joinable()) g_mod.keepalive_thread.join();
     g_mod.capture.Stop();
     g_mod.net.Stop();
@@ -302,6 +311,22 @@ void Shutdown() {
     std::lock_guard<std::mutex> lk(g_mod.dec_mu);
     g_mod.decoders.clear();
 }
+
+OverlayState SnapshotOverlayState() {
+    OverlayState s{};
+    s.ws_connected     = g_mod.net.IsConnected();
+    s.session_id       = g_mod.net.SessionID();
+    s.player_id        = 0;  // resolved server-side; not surfaced back to DLL yet
+    s.active_speakers  = g_mod.playback.ActiveSpeakers();
+    s.require_focus    = g_mod.cfg.require_focus;
+    s.always_on        = g_mod.cfg.always_on;
+    s.ptt_proximity_vk = g_mod.cfg.ptt_proximity;
+    return s;
+}
+
+void SetRequireFocus(bool v)    { g_mod.cfg.require_focus = v; }
+void SetAlwaysOn(bool v)        { g_mod.cfg.always_on     = v; }
+void SetPttProximityVk(int vk)  { g_mod.cfg.ptt_proximity = vk; }
 
 void OnRenderFrame() {
     // Refresh the TCP-port list periodically — by the time the user

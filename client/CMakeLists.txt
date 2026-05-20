@@ -48,6 +48,37 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(miniaudio)
 
+# ---- MinHook (BSD-2-Clause) — used by the D3D9 EndScene hook --------
+FetchContent_Declare(
+    minhook
+    GIT_REPOSITORY https://github.com/TsudaKageyu/minhook.git
+    GIT_TAG v1.3.4
+    GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(minhook)
+
+# ---- Dear ImGui (MIT) — in-game overlay -----------------------------
+FetchContent_Declare(
+    imgui
+    GIT_REPOSITORY https://github.com/ocornut/imgui.git
+    GIT_TAG v1.91.5
+    GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(imgui)
+add_library(imgui STATIC
+    ${imgui_SOURCE_DIR}/imgui.cpp
+    ${imgui_SOURCE_DIR}/imgui_draw.cpp
+    ${imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_dx9.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp
+)
+target_include_directories(imgui PUBLIC
+    ${imgui_SOURCE_DIR}
+    ${imgui_SOURCE_DIR}/backends
+)
+target_link_libraries(imgui PUBLIC d3d9 d3dcompiler)
+
 # ---- IXWebSocket (MIT) ----------------------------------------------
 FetchContent_Declare(
     ixwebsocket
@@ -68,6 +99,7 @@ add_library(l2voice SHARED
     voice/audio_io.cpp
     voice/opus_codec.cpp
     voice/voice_network.cpp
+    voice/overlay.cpp
 )
 
 target_include_directories(l2voice PRIVATE
@@ -79,9 +111,12 @@ target_include_directories(l2voice PRIVATE
 target_link_libraries(l2voice PRIVATE
     opus
     ixwebsocket
+    minhook
+    imgui
     ws2_32
     winmm
     iphlpapi
+    d3d9
 )
 
 target_compile_definitions(l2voice PRIVATE
