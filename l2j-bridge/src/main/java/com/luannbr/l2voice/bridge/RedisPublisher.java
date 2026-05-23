@@ -114,6 +114,26 @@ final class RedisPublisher {
                 ",\"leader_id\":" + newLeaderId));
     }
 
+    /** Command-channel state for one player. ccId=0 means the player
+     *  is no longer in any CC; members may still be empty even when
+     *  ccId > 0 (which simply means the bridge couldn't enumerate
+     *  members — voice-service treats it as a request to delete the
+     *  CC silently). */
+    void publishCCChange(int playerId, int ccId, int ccLeaderId, int[] members) {
+        StringBuilder sb = new StringBuilder(96);
+        sb.append("\"cc_id\":").append(ccId)
+          .append(",\"cc_leader_id\":").append(ccLeaderId)
+          .append(",\"members\":[");
+        if (members != null) {
+            for (int i = 0; i < members.length; i++) {
+                if (i > 0) sb.append(',');
+                sb.append(members[i]);
+            }
+        }
+        sb.append(']');
+        offer(envelope(playerId, "cc_change", sb.toString()));
+    }
+
     // ---- internals -----------------------------------------------------
 
     private static String envelope(int playerId, String event, String dataBody) {
@@ -124,6 +144,11 @@ final class RedisPublisher {
     }
 
     private void offer(String msg) {
+        // Phase B: fan the event out to every connected voice-server
+        // WS link in parallel with the Redis publish path. Both
+        // transports carry the same envelope; the voice-server picks
+        // whichever arrives (idempotent state mutations).
+        VoiceServerLink.broadcastEvent(msg);
         // Drop oldest when full — voice events are perishable.
         while (!queue.offer(msg)) {
             queue.poll();

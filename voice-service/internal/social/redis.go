@@ -67,15 +67,38 @@ type clanLeaderChangePayload struct {
 	LeaderID uint32 `json:"leader_id"`
 }
 
+// ccChangePayload — emitted by the bridge whenever a player's command
+// channel changes (joined, left, leader rotated, dissolved). cc_id=0
+// means the player is no longer in any CC.
+type ccChangePayload struct {
+	CCID      uint32   `json:"cc_id"`
+	LeaderID  uint32   `json:"cc_leader_id"`
+	MemberIDs []uint32 `json:"members"`
+}
+
+// OnPlayerStateChange is called by the subscriber after any event
+// mutates a player's world view. Implementations push fresh
+// client_state snapshots to the affected WS clients. The callback
+// must be cheap: it's invoked synchronously from the Redis recv loop.
+type OnPlayerStateChange func(playerID uint32)
+
+// OnPlayerLogout fires once when the bridge announces the player has
+// left the world (logged out, kicked, DC'd). Implementations should
+// close any WS connection for this player so the DLL knows to suspend.
+type OnPlayerLogout func(playerID uint32)
+
 // Subscribe runs the Redis SUBSCRIBE loop. Reconnects with backoff on
 // drop. Returns only when ctx is cancelled.
 //
 // state (topology) carries network-session-level data (UDP addr,
 // last-seen). worldState carries game-level data (clan/ally/party,
-// positions, sub-leaders, etc.). Both are updated as relevant events
-// arrive.
+// positions, sub-leaders, etc.). onStateChange (optional) is invoked
+// after each world mutation so the control plane can nudge clients.
+// onPlayerLogout (optional) fires once on player_logout events so the
+// control plane can close the WS to that player.
 func Subscribe(ctx context.Context, cfg Config, state *topology.State,
-	worldState *world.WorldState) error {
+	worldState *world.WorldState, onStateChange OnPlayerStateChange,
+	onPlayerLogout OnPlayerLogout) error {
 	if cfg.Channel == "" {
 		cfg.Channel = "l2voice:events"
 	}
@@ -84,7 +107,7 @@ func Subscribe(ctx context.Context, cfg Config, state *topology.State,
 		if err := ctx.Err(); err != nil {
 			return nil
 		}
-		if err := runOnce(ctx, cfg, state, worldState); err != nil {
+		if err := runOnce(ctx, cfg, state, worldState, onStateChange, onPlayerLogout); err != nil {
 			log.Printf("social: redis subscribe error: %v (retry in %v)", err, backoff)
 			select {
 			case <-time.After(backoff):
@@ -101,7 +124,8 @@ func Subscribe(ctx context.Context, cfg Config, state *topology.State,
 }
 
 func runOnce(ctx context.Context, cfg Config, state *topology.State,
-	worldState *world.WorldState) error {
+	worldState *world.WorldState, onStateChange OnPlayerStateChange,
+	onPlayerLogout OnPlayerLogout) error {
 	d := net.Dialer{Timeout: 5 * time.Second}
 	conn, err := d.DialContext(ctx, "tcp", cfg.Addr)
 	if err != nil {
@@ -143,22 +167,54 @@ func runOnce(ctx context.Context, cfg Config, state *topology.State,
 			// confirmation; ignore
 		case "message":
 			body, _ := arr[2].(string)
-			handleEvent([]byte(body), state, worldState)
+			handleEvent([]byte(body), state, worldState, onStateChange, onPlayerLogout)
 		case "pmessage":
 			if len(arr) >= 4 {
 				body, _ := arr[3].(string)
-				handleEvent([]byte(body), state, worldState)
+				handleEvent([]byte(body), state, worldState, onStateChange, onPlayerLogout)
 			}
 		}
 	}
 }
 
-func handleEvent(raw []byte, state *topology.State, w *world.WorldState) {
+// HandleEvent processes a single event envelope (same JSON shape as
+// the Redis stream). Exported so the bridge WebSocket path can call
+// it directly when Phase B is wired — same logic, two transports.
+func HandleEvent(raw []byte, state *topology.State, w *world.WorldState,
+	onStateChange OnPlayerStateChange, onPlayerLogout OnPlayerLogout) {
+	handleEvent(raw, state, w, onStateChange, onPlayerLogout)
+}
+
+func handleEvent(raw []byte, state *topology.State, w *world.WorldState,
+	onStateChange OnPlayerStateChange, onPlayerLogout OnPlayerLogout) {
 	var ev Event
 	if err := json.Unmarshal(raw, &ev); err != nil {
 		log.Printf("social: malformed event: %v", err)
 		return
 	}
+	// Diagnostic — log every non-position event so the operator can
+	// see clan/ally/party/cc/login/logout traffic. Position spam is
+	// suppressed (its arrival is implicit from "audio: sid=N rx=#K
+	// speakerPos=true" in the audio package).
+	if ev.Event != "position" {
+		log.Printf("social: ev=%s player=%d", ev.Event, ev.PlayerID)
+	}
+	// Set of players whose client_state view changed and who should be
+	// nudged. Always include the event subject. For group-membership
+	// events we ALSO include the old + new group members so peers see
+	// the join/leave in real time (was a missing fanout before).
+	affected := map[uint32]struct{}{}
+	if ev.PlayerID != 0 {
+		affected[ev.PlayerID] = struct{}{}
+	}
+	defer func() {
+		if onStateChange == nil {
+			return
+		}
+		for id := range affected {
+			onStateChange(id)
+		}
+	}()
 	// World state tracks ALL online players (independent of voice
 	// session), so we always update it. Voice-session updates only
 	// happen when a session has been allocated.
@@ -193,19 +249,26 @@ func handleEvent(raw []byte, state *topology.State, w *world.WorldState) {
 		if err := json.Unmarshal(ev.Data, &p); err != nil {
 			return
 		}
-		// Ensure the Player record exists; upsert without disturbing
-		// fields we don't know (use zeros for ally/party; subsequent
-		// ally/party events will fill them in).
+		// Fanout: old clan members (about to lose this player) +
+		// new clan members (about to gain them).
 		existing := w.Player(ev.PlayerID)
 		var allyID uint32
 		var partyID uint64
 		var instanceID uint32
+		var oldClanID uint32
 		if existing != nil {
 			allyID = existing.AllyID
 			partyID = existing.PartyID
 			instanceID = existing.InstanceID
+			oldClanID = existing.ClanID
+		}
+		for _, id := range w.ClanMembers(oldClanID) {
+			affected[id] = struct{}{}
 		}
 		w.UpsertPlayer(ev.PlayerID, p.ClanID, allyID, partyID, instanceID, p.IsLeader)
+		for _, id := range w.ClanMembers(p.ClanID) {
+			affected[id] = struct{}{}
+		}
 
 	case "ally_change":
 		var p allyChangePayload
@@ -216,13 +279,21 @@ func handleEvent(raw []byte, state *topology.State, w *world.WorldState) {
 		var clanID, instanceID uint32
 		var partyID uint64
 		var isLeader bool
+		var oldAllyID uint32
 		if existing != nil {
 			clanID = existing.ClanID
 			partyID = existing.PartyID
 			instanceID = existing.InstanceID
 			isLeader = existing.IsLeader
+			oldAllyID = existing.AllyID
+		}
+		for _, id := range w.AllyMembers(oldAllyID) {
+			affected[id] = struct{}{}
 		}
 		w.UpsertPlayer(ev.PlayerID, clanID, p.AllyID, partyID, instanceID, isLeader)
+		for _, id := range w.AllyMembers(p.AllyID) {
+			affected[id] = struct{}{}
+		}
 
 	case "party_change":
 		var p partyChangePayload
@@ -238,7 +309,15 @@ func handleEvent(raw []byte, state *topology.State, w *world.WorldState) {
 			instanceID = existing.InstanceID
 			isLeader = existing.IsLeader
 		}
+		// Old party members (about to see this player leave).
+		for _, id := range w.PartyMembers(ev.PlayerID) {
+			affected[id] = struct{}{}
+		}
 		w.UpsertPlayer(ev.PlayerID, clanID, allyID, p.PartyID, instanceID, isLeader)
+		// New party members (now see this player join).
+		for _, id := range w.PartyMembers(ev.PlayerID) {
+			affected[id] = struct{}{}
+		}
 
 	case "clan_leader_change":
 		var p clanLeaderChangePayload
@@ -246,12 +325,61 @@ func handleEvent(raw []byte, state *topology.State, w *world.WorldState) {
 			return
 		}
 		w.UpsertClan(p.ClanID, p.LeaderID, false)
+		for _, id := range w.ClanMembers(p.ClanID) {
+			affected[id] = struct{}{}
+		}
+
+	case "cc_change":
+		var p ccChangePayload
+		if err := json.Unmarshal(ev.Data, &p); err != nil {
+			return
+		}
+		// Capture the old CC's members before mutating so they get
+		// a state push that no longer lists this player.
+		if oldCC := w.CommandChannel(ev.PlayerID); oldCC != nil {
+			for _, id := range oldCC.MemberIDs {
+				affected[id] = struct{}{}
+			}
+		}
+		if p.CCID == 0 {
+			// Player left their CC; we can only dissolve from the
+			// player side — if there were other members the bridge
+			// will republish them with the survivors. As a safety
+			// net here, drop this single player from any CC they're
+			// currently tracked in.
+			if cc := w.CommandChannel(ev.PlayerID); cc != nil {
+				// Rebuild without this player (fresh slice to avoid
+				// aliasing into UpsertCommandChannel which retains it).
+				out := make([]uint32, 0, len(cc.MemberIDs))
+				for _, id := range cc.MemberIDs {
+					if id != ev.PlayerID {
+						out = append(out, id)
+					}
+				}
+				if len(out) == 0 {
+					w.DissolveCommandChannel(cc.ID)
+				} else {
+					w.UpsertCommandChannel(cc.ID, cc.LeaderID, out)
+				}
+			}
+		} else {
+			w.UpsertCommandChannel(p.CCID, p.LeaderID, p.MemberIDs)
+			for _, id := range p.MemberIDs {
+				affected[id] = struct{}{}
+			}
+		}
 
 	case "player_logout":
 		if sess != nil {
 			state.Drop(sess.ID)
 		}
 		w.RemovePlayer(ev.PlayerID)
+		// Force-close any open WS for this player. Without this, the
+		// DLL stays connected with a now-invalid session and the
+		// overlay keeps showing as if the player were still in-world.
+		if onPlayerLogout != nil {
+			onPlayerLogout(ev.PlayerID)
+		}
 	}
 }
 

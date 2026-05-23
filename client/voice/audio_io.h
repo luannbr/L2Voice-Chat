@@ -93,6 +93,13 @@ public:
     void  SetSourceVolume(uint32_t src_id, float volume);
     float GetSourceVolume(uint32_t src_id);
 
+    // Pops up to `samples` of the most recent mixed mono playback into
+    // `dst`. Used as the "far-end" reference for AEC (Speex DSP). If
+    // fewer samples are available the tail is zero-filled. Thread-safe.
+    // The post-mixdown is downmixed L/R/2 — same signal that goes out
+    // the speakers, so the AEC sees what the user actually hears.
+    void PopPlaybackReference(int16_t* dst, uint32_t samples);
+
 private:
     struct Impl;
     Impl* impl_;

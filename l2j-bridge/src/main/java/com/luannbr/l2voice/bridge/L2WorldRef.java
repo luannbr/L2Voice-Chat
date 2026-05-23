@@ -36,6 +36,14 @@ final class L2WorldRef {
     // feature off rather than aborting init.
     private Method getLeaderId;       // L2Clan.getLeaderId()
 
+    // Command Channel (CC) — L2Party.getCommandChannel() returns an
+    // L2CommandChannel; the CC has a leader (L2PcInstance) and a list
+    // of L2Partys. All resolved by-name with reflection-tolerant
+    // lookup so missing methods just disable CC voice gracefully.
+    private Method getCommandChannel;       // L2Party.getCommandChannel()
+    private Method ccGetChannelLeader;      // L2CommandChannel.getChannelLeader()
+    private Method ccGetPartys;             // L2CommandChannel.getPartys() / getPartyMembers()
+
     L2WorldRef() throws Exception {
         Class<?> world = Class.forName("net.l2emuproject.gameserver.model.L2World");
         getAllPlayers = world.getMethod("getAllPlayers");
@@ -60,6 +68,14 @@ final class L2WorldRef {
         getOnlineMembersList   = clan == null ? null : tryGetMethod(clan, "getOnlineMembersList");
         getAllyId              = clan == null ? null : tryGetMethod(clan, "getAllyId");
         getLeaderId            = clan == null ? null : tryGetMethod(clan, "getLeaderId");
+        getCommandChannel      = party == null ? null : tryGetMethod(party, "getCommandChannel");
+        Class<?> cc = tryClass("net.l2emuproject.gameserver.model.L2CommandChannel");
+        ccGetChannelLeader     = cc == null ? null : tryGetMethod(cc, "getChannelLeader");
+        // L2J builds vary: some use getPartys(), some getPartyMembers().
+        ccGetPartys            = cc == null ? null : tryGetMethod(cc, "getPartys");
+        if (ccGetPartys == null && cc != null) {
+            ccGetPartys = tryGetMethod(cc, "getPartyMembers");
+        }
 
         Class<?> gameClient = Class.forName(
                 "net.l2emuproject.gameserver.network.L2GameClient");
@@ -141,9 +157,21 @@ final class L2WorldRef {
             int port = sk.getPort();
             if (addr == null) continue;
             String host = addr.getHostAddress();
-            // Accept exact IP match OR localhost equivalence.
-            boolean ipOk = host.equals(clientIp)
-                    || (isLoopback(host) && isLoopback(clientIp));
+            // IP matching rules:
+            //  - If the L2GameClient is loopback, the L2 client lives on
+            //    the same machine as the GS. The voice-server (which may
+            //    be remote, e.g. on a VPS) sees the WS connection from
+            //    the user's PUBLIC IP, which won't match 127.0.0.1. The
+            //    port number is unique per active TCP socket on this
+            //    machine, so the port match alone is sufficient.
+            //  - Otherwise (production: GS on its own host, L2 clients
+            //    on player PCs), require exact IP match.
+            boolean ipOk;
+            if (isLoopback(host)) {
+                ipOk = true;
+            } else {
+                ipOk = host.equals(clientIp);
+            }
             if (!ipOk) continue;
             if (!candidatePorts.contains(port)) continue;
             return (int) getObjectId.invoke(p);
@@ -166,6 +194,11 @@ final class L2WorldRef {
         int allyId;          // 0 = no alliance
         int partyId;         // 0 = no party; otherwise identityHashCode(L2Party)
         boolean isClanLeader;
+
+        // Command Channel (CC). All 0 / empty when player is not in a CC.
+        int ccId;            // identityHashCode(L2CommandChannel) & 0x7FFFFFFF
+        int ccLeaderId;
+        int[] ccMembers;     // all object-ids in the CC, including the leader
     }
 
     /** Reads everything Phase-A cares about from one L2PcInstance. */
@@ -193,9 +226,56 @@ final class L2WorldRef {
             // No stable id in L2Party — use object identity. Stable
             // within a single bridge JVM lifetime; resets on restart
             // (voice-service caches will recover within ~5 s polls).
-            s.partyId = System.identityHashCode(party);
+            // Mask off the sign bit so JSON serialization stays positive;
+            // the Go side unmarshals into uint64 and rejects negatives.
+            s.partyId = System.identityHashCode(party) & 0x7FFFFFFF;
+
+            // Command Channel — only L2Party knows about it.
+            if (getCommandChannel != null) {
+                Object commandChannel = getCommandChannel.invoke(party);
+                if (commandChannel != null) {
+                    s.ccId = System.identityHashCode(commandChannel) & 0x7FFFFFFF;
+                    if (ccGetChannelLeader != null) {
+                        Object leader = ccGetChannelLeader.invoke(commandChannel);
+                        if (leader != null) {
+                            s.ccLeaderId = (int) getObjectId.invoke(leader);
+                        }
+                    }
+                    s.ccMembers = collectCCMemberIds(commandChannel);
+                }
+            }
         }
         return s;
+    }
+
+    /** Walks all L2Partys inside the CC and collects every member's
+     *  object-id, including the channel leader. Empty array if the
+     *  L2J build doesn't expose getPartys()/getPartyMembers(). */
+    private int[] collectCCMemberIds(Object commandChannel) throws Exception {
+        if (ccGetPartys == null || getPartyMembers == null) return new int[0];
+        Object partys = ccGetPartys.invoke(commandChannel);
+        if (partys == null) return new int[0];
+        java.util.List<Integer> ids = new java.util.ArrayList<>();
+        Iterable<?> iter;
+        if (partys instanceof Iterable<?> it)        iter = it;
+        else if (partys instanceof Object[] arr)     iter = java.util.Arrays.asList(arr);
+        else if (partys instanceof java.util.Map<?,?> m) iter = m.values();
+        else return new int[0];
+        for (Object p : iter) {
+            if (p == null) continue;
+            Object members = getPartyMembers.invoke(p);
+            if (members == null) continue;
+            Iterable<?> mIter;
+            if (members instanceof Iterable<?> mi)        mIter = mi;
+            else if (members instanceof Object[] arr)     mIter = java.util.Arrays.asList(arr);
+            else continue;
+            for (Object pc : mIter) {
+                if (pc != null) ids.add((int) getObjectId.invoke(pc));
+            }
+        }
+        int[] out = new int[ids.size()];
+        for (int i = 0; i < out.length; i++) out[i] = ids.get(i);
+        return out;
     }
 
     private static int invokeIntOrZero(Object target, String methodName) {

@@ -31,7 +31,10 @@ const (
 	ChParty       Channel = 1
 	ChClan        Channel = 2
 	ChAlly        Channel = 3
-	ChModeUnified Channel = 5 // synthetic egress channel when a clan mode is active
+	ChCC          Channel = 4 // L2 Command Channel
+	// Channels 5/6/7 are reserved for ingress control frames on the
+	// wire (keepalive=5, ping_req=6, ping_resp=7).
+	ChModeUnified Channel = 8 // egress-only synthetic channel under active clan mode
 )
 
 // Role within a clan, as far as the voice system is concerned.
@@ -121,6 +124,18 @@ type Alliance struct {
 	MemberClans  []uint32 // includes LeaderClanID
 }
 
+// CommandChannel mirrors L2's `L2CommandChannel`. Membership is a
+// flat list of player object-ids; the leader (= main party leader
+// who initiated the CC) is the only one who can speak by default.
+// Other members may be granted speak permission individually via
+// SetCCSpeakPermission.
+type CommandChannel struct {
+	ID               uint32              // L2J CC identity (we use leader id at first since L2 CC has no stable id)
+	LeaderID         uint32
+	MemberIDs        []uint32
+	SpeakPermissions map[uint32]struct{} // members allowed to speak (leader is always allowed implicitly)
+}
+
 // RemoteMute is a session-scoped mute applied by a clan leader or
 // sub-leader to a clan/ally member. Lives until either party
 // disconnects.
@@ -140,6 +155,8 @@ type WorldState struct {
 	clans       map[uint32]*Clan
 	alliances   map[uint32]*Alliance
 	parties     map[uint64]map[uint32]struct{} // partyID -> set of memberIDs
+	ccs         map[uint32]*CommandChannel     // keyed by CC id
+	playerCC    map[uint32]uint32              // playerID -> ccID (reverse index)
 	remoteMutes []*RemoteMute
 }
 
@@ -150,6 +167,8 @@ func NewWorldState() *WorldState {
 		clans:     map[uint32]*Clan{},
 		alliances: map[uint32]*Alliance{},
 		parties:   map[uint64]map[uint32]struct{}{},
+		ccs:       map[uint32]*CommandChannel{},
+		playerCC:  map[uint32]uint32{},
 	}
 }
 
@@ -210,6 +229,33 @@ func (w *WorldState) RemovePlayer(id uint32) {
 			c.Mode = ModeNone
 			c.ModeSetBy = 0
 		}
+	}
+	// Drop CC membership + speak permissions; if the player was the
+	// CC leader, the CC itself is dissolved (bridge will re-emit on
+	// new leader if one is appointed).
+	if ccID, mapped := w.playerCC[id]; mapped {
+		if cc, ok := w.ccs[ccID]; ok {
+			delete(cc.SpeakPermissions, id)
+			// Filter member list.
+			n := 0
+			for _, m := range cc.MemberIDs {
+				if m != id {
+					cc.MemberIDs[n] = m
+					n++
+				}
+			}
+			cc.MemberIDs = cc.MemberIDs[:n]
+			if cc.LeaderID == id {
+				// Dissolve — drop all reverse entries.
+				for _, m := range cc.MemberIDs {
+					if curr, ok2 := w.playerCC[m]; ok2 && curr == ccID {
+						delete(w.playerCC, m)
+					}
+				}
+				delete(w.ccs, ccID)
+			}
+		}
+		delete(w.playerCC, id)
 	}
 	// Drop any remote mutes involving this player.
 	out := w.remoteMutes[:0]
@@ -316,6 +362,136 @@ func (w *WorldState) SetClanOptOut(clanID uint32, optOut bool) bool {
 	}
 	c.OptedOutOfUnifiedMode = optOut
 	return true
+}
+
+// ---- Command Channel ----
+
+// UpsertCommandChannel registers or updates a CC. `ccID` is the L2J
+// identity (we use the leader id in the bridge to make it stable
+// across leader handoffs within the same CC instance). `members` is
+// the full snapshot — pass empty to dissolve.
+//
+// Preserves SpeakPermissions for members that are still in the
+// channel; drops permissions for those who left.
+func (w *WorldState) UpsertCommandChannel(ccID, leaderID uint32, members []uint32) *CommandChannel {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	cc, ok := w.ccs[ccID]
+	if !ok {
+		cc = &CommandChannel{
+			ID:               ccID,
+			SpeakPermissions: map[uint32]struct{}{},
+		}
+		w.ccs[ccID] = cc
+	}
+	cc.LeaderID = leaderID
+	// Rebuild reverse index for any old members no longer in this CC.
+	old := cc.MemberIDs
+	cc.MemberIDs = append(cc.MemberIDs[:0], members...)
+	now := map[uint32]struct{}{}
+	for _, id := range members {
+		now[id] = struct{}{}
+		w.playerCC[id] = ccID
+	}
+	for _, id := range old {
+		if _, still := now[id]; !still {
+			if curr, mapped := w.playerCC[id]; mapped && curr == ccID {
+				delete(w.playerCC, id)
+			}
+			delete(cc.SpeakPermissions, id)
+		}
+	}
+	return cc
+}
+
+// DissolveCommandChannel removes a CC entirely (e.g. leader dissolved
+// it). All speak permissions and reverse indices are cleared.
+func (w *WorldState) DissolveCommandChannel(ccID uint32) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	cc, ok := w.ccs[ccID]
+	if !ok {
+		return
+	}
+	for _, id := range cc.MemberIDs {
+		if curr, mapped := w.playerCC[id]; mapped && curr == ccID {
+			delete(w.playerCC, id)
+		}
+	}
+	delete(w.ccs, ccID)
+}
+
+// SetCCSpeakPermission grants (true) or revokes (false) a member's
+// speak permission within `ccID`. Returns true on success.
+// Authorization is the caller's responsibility (only CC leader).
+func (w *WorldState) SetCCSpeakPermission(ccID, targetID uint32, allow bool) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	cc, ok := w.ccs[ccID]
+	if !ok {
+		return false
+	}
+	// Target must be in the CC (and not the leader — they're implicit).
+	if targetID == cc.LeaderID {
+		return false
+	}
+	inCC := false
+	for _, id := range cc.MemberIDs {
+		if id == targetID {
+			inCC = true
+			break
+		}
+	}
+	if !inCC {
+		return false
+	}
+	if allow {
+		cc.SpeakPermissions[targetID] = struct{}{}
+	} else {
+		delete(cc.SpeakPermissions, targetID)
+	}
+	return true
+}
+
+// CommandChannel returns the CC the given player belongs to, or nil.
+// The returned pointer is read-only (caller mustn't mutate without
+// taking the lock again via setter methods).
+func (w *WorldState) CommandChannel(playerID uint32) *CommandChannel {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	ccID, ok := w.playerCC[playerID]
+	if !ok {
+		return nil
+	}
+	return w.ccs[ccID]
+}
+
+// CommandChannelByID returns the CC by its id.
+func (w *WorldState) CommandChannelByID(ccID uint32) *CommandChannel {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.ccs[ccID]
+}
+
+// CCSpeakAllowed reports whether `senderID` may transmit on the CC
+// channel — true for leader, true for any member with explicit
+// permission, false otherwise (including non-members).
+func (w *WorldState) CCSpeakAllowed(senderID uint32) bool {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	ccID, ok := w.playerCC[senderID]
+	if !ok {
+		return false
+	}
+	cc := w.ccs[ccID]
+	if cc == nil {
+		return false
+	}
+	if senderID == cc.LeaderID {
+		return true
+	}
+	_, allowed := cc.SpeakPermissions[senderID]
+	return allowed
 }
 
 // ---- Remote mutes ----
@@ -445,6 +621,20 @@ func (w *WorldState) ClanMembers(clanID uint32) []uint32 {
 	for id, p := range w.players {
 		if p.ClanID == clanID {
 			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// PlayersInInstance returns a snapshot of players in the given instance.
+// Used by the proximity router.
+func (w *WorldState) PlayersInInstance(instanceID uint32) []*Player {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	out := make([]*Player, 0, 16)
+	for _, p := range w.players {
+		if p.InstanceID == instanceID {
+			out = append(out, p)
 		}
 	}
 	return out

@@ -78,12 +78,34 @@ final class PositionPoller {
             long t0 = System.currentTimeMillis();
             try {
                 final int[] cnt = {0, 0};   // seen, events_published
+                final java.util.Set<Integer> currentTick = new java.util.HashSet<>(last.size() + 16);
                 world.forEachSnapshot(s -> {
                     cnt[0]++;
                     publishedThisTick = 0;
+                    boolean firstSight = !last.containsKey(s.objectId);
+                    if (firstSight) {
+                        pub.publishPlayerLogin(s.objectId);
+                        publishedThisTick++;
+                    }
+                    currentTick.add(s.objectId);
                     tickPlayer(s);
                     cnt[1] += publishedThisTick;
                 });
+                // Anyone in `last` but not in `currentTick` logged out
+                // (or fell off the world iterator for some other reason —
+                // either way, voice-service should drop the session).
+                if (!last.isEmpty()) {
+                    java.util.Iterator<Integer> it = last.keySet().iterator();
+                    while (it.hasNext()) {
+                        int id = it.next();
+                        if (!currentTick.contains(id)) {
+                            pub.publishPlayerLogout(id);
+                            it.remove();
+                            lastPosPublishMs.remove(id);
+                            cnt[1]++;
+                        }
+                    }
+                }
                 publishedSinceStats += cnt[1];
                 if (t0 - lastStats > 30_000) {
                     log.info("PositionPoller: " + cnt[0] + " players visible, "
@@ -104,6 +126,25 @@ final class PositionPoller {
     }
 
     private int publishedThisTick = 0;
+
+    /** Compares two int sets without regard to order. Cheap O(n) for
+     *  the small (<= ~30) member lists L2 CCs have in practice. */
+    private static boolean sameIntSet(int[] a, int[] b) {
+        if (a == null && b == null) return true;
+        if (a == null || b == null) return false;
+        if (a.length != b.length) return false;
+        if (a.length == 0) return true;
+        // For small arrays the linear contains-check is fine; avoid
+        // allocating a HashSet per tick per player.
+        outer:
+        for (int x : a) {
+            for (int y : b) {
+                if (x == y) continue outer;
+            }
+            return false;
+        }
+        return true;
+    }
 
     private void tickPlayer(L2WorldRef.PlayerSnapshot s) {
         L2WorldRef.PlayerSnapshot prev = last.get(s.objectId);
@@ -134,6 +175,17 @@ final class PositionPoller {
         }
         if (prev == null || prev.instanceId != s.instanceId) {
             pub.publishInstanceChange(s.objectId, s.instanceId);
+            publishedThisTick++;
+        }
+        // Command channel: diff by (ccId, ccLeaderId, member set). Any
+        // change re-publishes the full member list — voice-service
+        // does the bookkeeping on its side.
+        boolean ccChanged = prev == null
+                || prev.ccId != s.ccId
+                || prev.ccLeaderId != s.ccLeaderId
+                || !sameIntSet(prev.ccMembers, s.ccMembers);
+        if (ccChanged) {
+            pub.publishCCChange(s.objectId, s.ccId, s.ccLeaderId, s.ccMembers);
             publishedThisTick++;
         }
 

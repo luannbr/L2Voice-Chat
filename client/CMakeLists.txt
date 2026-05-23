@@ -91,6 +91,84 @@ target_include_directories(imgui PUBLIC
 )
 target_link_libraries(imgui PUBLIC d3d9 d3dcompiler)
 
+# ---- rnnoise (Xiph, BSD) — neural noise suppression -----------------
+# Upstream xiph/rnnoise master moved to autotools/meson-generated config
+# headers and broke MSVC. cpuimage/rnnoise is a long-standing, MSVC-clean
+# mirror that keeps the same Xiph BSD license, embeds the trained weights
+# in rnn_data.c, and matches the upstream public API (rnnoise_create /
+# rnnoise_destroy / rnnoise_process_frame in rnnoise.h).
+FetchContent_Declare(
+    rnnoise
+    GIT_REPOSITORY https://github.com/cpuimage/rnnoise.git
+    GIT_TAG master
+    GIT_SHALLOW TRUE
+)
+FetchContent_GetProperties(rnnoise)
+if(NOT rnnoise_POPULATED)
+    FetchContent_Populate(rnnoise)
+endif()
+# cpuimage layout: rnnoise.h in include/, .c sources in src/. Uses
+# stb_fft.h (header-only) instead of kiss_fft.c, and the trained model is
+# baked into rnn_data.c — no rnn_reader.c needed.
+add_library(rnnoise STATIC
+    ${rnnoise_SOURCE_DIR}/src/celt_lpc.c
+    ${rnnoise_SOURCE_DIR}/src/denoise.c
+    ${rnnoise_SOURCE_DIR}/src/pitch.c
+    ${rnnoise_SOURCE_DIR}/src/rnn.c
+    ${rnnoise_SOURCE_DIR}/src/rnn_data.c
+)
+target_include_directories(rnnoise PUBLIC
+    ${rnnoise_SOURCE_DIR}/include
+)
+target_include_directories(rnnoise PRIVATE
+    ${rnnoise_SOURCE_DIR}/src
+)
+# rnnoise is pure C — suppress MSVC's chatter about implicit conversions.
+if(MSVC)
+    target_compile_options(rnnoise PRIVATE /W0)
+endif()
+
+# ---- Speex DSP (Xiph, BSD) — acoustic echo cancellation -------------
+# We only use the AEC subset (mdf.c). NS/AGC are handled by rnnoise +
+# our Apm. xiph/speexdsp has no upstream CMakeLists, so we list the
+# minimal AEC-only file set and provide a tiny config.h. Pure float
+# build (FLOATING_POINT) with the bundled KISS FFT backend.
+FetchContent_Declare(
+    speexdsp
+    GIT_REPOSITORY https://github.com/xiph/speexdsp.git
+    GIT_TAG SpeexDSP-1.2.1
+    GIT_SHALLOW TRUE
+)
+FetchContent_GetProperties(speexdsp)
+if(NOT speexdsp_POPULATED)
+    FetchContent_Populate(speexdsp)
+endif()
+# Minimal config.h — speexdsp uses HAVE_CONFIG_H gating internally.
+# Without it the source defaults are fine for a basic float build, so
+# we deliberately don't define HAVE_CONFIG_H — speexdsp falls back to
+# its built-in defaults via #ifdef HAVE_CONFIG_H guards.
+add_library(speexdsp STATIC
+    ${speexdsp_SOURCE_DIR}/libspeexdsp/mdf.c
+    ${speexdsp_SOURCE_DIR}/libspeexdsp/fftwrap.c
+    ${speexdsp_SOURCE_DIR}/libspeexdsp/kiss_fft.c
+    ${speexdsp_SOURCE_DIR}/libspeexdsp/kiss_fftr.c
+)
+target_include_directories(speexdsp PUBLIC
+    ${speexdsp_SOURCE_DIR}/include
+)
+target_include_directories(speexdsp PRIVATE
+    ${speexdsp_SOURCE_DIR}/libspeexdsp
+)
+target_compile_definitions(speexdsp PRIVATE
+    FLOATING_POINT     # use float (not fixed-point) math
+    USE_KISS_FFT       # bundle the kiss_fft backend
+    EXPORT=            # speex's "extern" decorator — empty for static lib
+    RANDOM_PREFIX=speex_rnd
+)
+if(MSVC)
+    target_compile_options(speexdsp PRIVATE /W0)
+endif()
+
 # ---- IXWebSocket (MIT) ----------------------------------------------
 FetchContent_Declare(
     ixwebsocket
@@ -105,17 +183,60 @@ set(USE_ZLIB     OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(ixwebsocket)
 
 # ---- the DLL --------------------------------------------------------
-# Generate the resource script with an absolute path to the PNG so
-# the RC compiler can find it at build time. Embedded into the DLL
-# binary — no external file needed at runtime.
-set(MIC_PNG_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../voice-recorder.png")
-file(TO_NATIVE_PATH "${MIC_PNG_PATH}" MIC_PNG_PATH)
-string(REPLACE "\\" "\\\\" MIC_PNG_PATH "${MIC_PNG_PATH}")
-configure_file(
-    ${CMAKE_CURRENT_SOURCE_DIR}/voice/resources.rc.in
-    ${CMAKE_CURRENT_BINARY_DIR}/l2voice_resources.rc
-    @ONLY
-)
+# VOICE_L2_THEME (default OFF): when ON, the overlay uses native L2UI
+# textures for buttons/frames/tabs. Those textures are NCSoft IP and
+# NOT distributed with this repo — users who own an L2 client can
+# supply their own `l2ui_assets/` folder at the repo root. When OFF
+# the overlay falls back to the ImGui default look and only the
+# microphone PNGs (originally authored / public-domain icons) are
+# embedded. This is the supported open-source path.
+option(VOICE_L2_THEME "Bundle NCSoft L2UI textures (requires user-supplied l2ui_assets/)" OFF)
+
+# Generate the resource script with absolute paths to the PNGs so
+# the RC compiler can find them at build time. PNGs listed here are
+# embedded into the DLL binary — no external file needed at runtime.
+function(_resolve_resource_png var_name rel_path)
+    set(p "${CMAKE_CURRENT_SOURCE_DIR}/${rel_path}")
+    file(TO_NATIVE_PATH "${p}" p)
+    string(REPLACE "\\" "\\\\" p "${p}")
+    set(${var_name} "${p}" PARENT_SCOPE)
+endfunction()
+# Microphone-state icons — always embedded.
+_resolve_resource_png(MIC_PNG_PATH          "../voice-recorder.png")
+_resolve_resource_png(MIC_SPEAKING_PNG_PATH "../microfone_falando.png")
+_resolve_resource_png(MIC_MUTED_PNG_PATH    "../microfone_mudo.png")
+_resolve_resource_png(MIC_BLOCKED_PNG_PATH  "../microfone_block.png")
+
+if(VOICE_L2_THEME)
+    message(STATUS "VOICE_L2_THEME=ON — expecting l2ui_assets/ at repo root.")
+    _resolve_resource_png(L2UI_BTN_BIG_PATH           "../l2ui_assets/L2UI_CH3_Button_bigbutton3.png")
+    _resolve_resource_png(L2UI_BTN_BIG_OVER_PATH      "../l2ui_assets/L2UI_CH3_Button_bigbutton3_over.png")
+    _resolve_resource_png(L2UI_BTN_BIG_DOWN_PATH      "../l2ui_assets/L2UI_CH3_Button_bigbutton3_down.png")
+    _resolve_resource_png(L2UI_BTN_SMALL_PATH         "../l2ui_assets/L2UI_CH3_Button_smallbutton1.png")
+    _resolve_resource_png(L2UI_BTN_SMALL_OVER_PATH    "../l2ui_assets/L2UI_CH3_Button_smallbutton1_over.png")
+    _resolve_resource_png(L2UI_BTN_SMALL_DOWN_PATH    "../l2ui_assets/L2UI_CH3_Button_smallbutton1_down.png")
+    _resolve_resource_png(L2UI_FRAME_MINI_PATH        "../l2ui_assets/L2UI_CH3_FRAMECTRL_FrameMiniBtn.png")
+    _resolve_resource_png(L2UI_FRAME_MINI_OVER_PATH   "../l2ui_assets/L2UI_CH3_FRAMECTRL_frameminibtn_over.png")
+    _resolve_resource_png(L2UI_FRAME_MINI_DOWN_PATH   "../l2ui_assets/L2UI_CH3_FRAMECTRL_FrameMiniBtn_down.png")
+    _resolve_resource_png(L2UI_FRAME_CLOSE_PATH       "../l2ui_assets/L2UI_CH3_FRAMECTRL_FrameCloseBtn.png")
+    _resolve_resource_png(L2UI_FRAME_CLOSE_OVER_PATH  "../l2ui_assets/L2UI_CH3_FRAMECTRL_frameclosebtn_over.png")
+    _resolve_resource_png(L2UI_FRAME_CLOSE_DOWN_PATH  "../l2ui_assets/L2UI_CH3_FRAMECTRL_FrameCloseBtn_down.png")
+    _resolve_resource_png(L2UI_TAB_SELECTED_PATH         "../l2ui_assets/L2UI_NewTex_HennaWnd_TabBtn_Selected.png")
+    _resolve_resource_png(L2UI_TAB_UNSELECTED_PATH       "../l2ui_assets/L2UI_NewTex_HennaWnd_TabBtn_Unselected.png")
+    _resolve_resource_png(L2UI_TAB_UNSELECTED_OVER_PATH  "../l2ui_assets/L2UI_NewTex_HennaWnd_TabBtn_Unselected_Over.png")
+    _resolve_resource_png(L2UI_WND_BG_PATH               "../l2ui_assets/L2UI_CH3_NpcWnd_npc1_back.png")
+    configure_file(
+        ${CMAKE_CURRENT_SOURCE_DIR}/voice/resources.rc.in
+        ${CMAKE_CURRENT_BINARY_DIR}/l2voice_resources.rc
+        @ONLY
+    )
+else()
+    configure_file(
+        ${CMAKE_CURRENT_SOURCE_DIR}/voice/resources_minimal.rc.in
+        ${CMAKE_CURRENT_BINARY_DIR}/l2voice_resources.rc
+        @ONLY
+    )
+endif()
 
 add_library(l2voice SHARED
     dllmain.cpp
@@ -124,6 +245,7 @@ add_library(l2voice SHARED
     voice/opus_codec.cpp
     voice/voice_network.cpp
     voice/overlay.cpp
+    voice/apm.cpp
     ${CMAKE_CURRENT_BINARY_DIR}/l2voice_resources.rc
 )
 
@@ -136,6 +258,8 @@ target_include_directories(l2voice PRIVATE
 
 target_link_libraries(l2voice PRIVATE
     opus
+    rnnoise
+    speexdsp
     ixwebsocket
     minhook
     imgui

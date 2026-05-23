@@ -29,7 +29,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/luannbr/l2voice/voice-service/internal/router"
 	"github.com/luannbr/l2voice/voice-service/internal/topology"
+	"github.com/luannbr/l2voice/voice-service/internal/world"
 )
 
 // L2J bridge /voice/group endpoint URL — set from main.go.
@@ -109,14 +111,15 @@ const (
 )
 
 const (
-	chProximity uint8 = 0
-	chParty     uint8 = 1
-	chClan      uint8 = 2
-	chAlly      uint8 = 3
-	chSiege     uint8 = 4
-	chKeepalive uint8 = 5
-	chPingReq   uint8 = 6
-	chPingResp  uint8 = 7
+	chProximity   uint8 = 0
+	chParty       uint8 = 1
+	chClan        uint8 = 2
+	chAlly        uint8 = 3
+	chCC          uint8 = 4  // L2 Command Channel (was "chSiege" — repurposed)
+	chKeepalive   uint8 = 5  // ingress-only control frame; never on egress
+	chPingReq     uint8 = 6
+	chPingResp    uint8 = 7
+	chModeUnified uint8 = 8  // egress-only — server-rewritten clan/ally under active mode
 )
 
 // rxCount is a session-id keyed counter of inbound proximity packets,
@@ -131,10 +134,18 @@ type Config struct {
 	// with gain=255 / pan=0 (in addition to normal spatial routing).
 	// Useful for loopback validation before there are two clients.
 	Echo bool
+	// MultiboxMute: when true (default), proximity audio between
+	// sessions sharing the same client IP is suppressed — keeps a
+	// multibox player from hearing their own characters echo back.
+	// Set false on staging/VPS tests where the operator IS opening
+	// multiple clients on purpose to validate end-to-end delivery.
+	MultiboxMute bool
 }
 
 // Serve binds udpAddr and routes audio packets until ctx is cancelled.
-func Serve(ctx context.Context, udpAddr string, state *topology.State, cfg Config) error {
+// `worldState` is consulted by the router for group/CC channels.
+func Serve(ctx context.Context, udpAddr string, state *topology.State,
+	worldState *world.WorldState, cfg Config) error {
 	addr, err := net.ResolveUDPAddr("udp", udpAddr)
 	if err != nil {
 		return err
@@ -195,8 +206,9 @@ func Serve(ctx context.Context, udpAddr string, state *topology.State, cfg Confi
 		switch channel {
 		case chProximity:
 			routeProximity(seqLo, sid, buf[8:n], sess, state, conn, cfg)
-		case chParty, chClan, chAlly:
-			routeGroup(channel, seqLo, sid, buf[8:n], sess, state, conn)
+		case chParty, chClan, chAlly, chCC:
+			routeViaRouter(channel, seqLo, sid, buf[8:n], sess,
+				state, worldState, conn)
 		case chKeepalive:
 			// LastSeen already touched on first packet via RememberUDP path.
 		case chPingReq:
@@ -207,7 +219,7 @@ func Serve(ctx context.Context, udpAddr string, state *topology.State, cfg Confi
 			binary.LittleEndian.PutUint32(out[4:8], sid)
 			conn.WriteToUDP(out[:], from)
 		default:
-			// siege not implemented.
+			// unknown channel; drop
 		}
 	}
 }
@@ -266,6 +278,24 @@ func routeProximity(seqLo uint16, srcSID uint32, opus []byte,
 			}
 			continue
 		}
+		// Multibox auto-mute (Phase 5): when speaker and recipient
+		// share the same source IP, they're almost certainly two
+		// L2 clients running on the same physical machine. Suppress
+		// the proximity playback so the multiboxer doesn't hear
+		// their own characters echoing back through the speakers.
+		// Other channels (party/clan/ally/CC) intentionally still
+		// route — they're per-account, not per-machine.
+		//
+		// Disabled by `-multibox-mute=false` for staging tests where
+		// the operator is opening multiple clients on purpose.
+		if cfg.MultiboxMute && speaker.UDPAddr != nil && recv.UDPAddr != nil &&
+			speaker.UDPAddr.IP.Equal(recv.UDPAddr.IP) {
+			if rxCount[srcSID]%50 == 1 {
+				log.Printf("audio:   skip recv sid=%d — multibox (same IP %s)",
+					recv.ID, recv.UDPAddr.IP)
+			}
+			continue
+		}
 		if !recv.PositionKnown(now) {
 			if rxCount[srcSID]%50 == 1 {
 				log.Printf("audio:   skip recv sid=%d — no position", recv.ID)
@@ -301,45 +331,64 @@ func routeProximity(seqLo uint16, srcSID uint32, opus []byte,
 	}
 }
 
-// routeGroup forwards a party/clan/ally opus payload to every player
-// the bridge reports as belonging to the speaker's group. No spatial
-// math, no gain stamping — group voice is full-volume, mono. Packet
-// shape on egress matches the proximity channel (10 bytes header)
-// but gain/pan are always (255, 0) so the client mixes at unity gain.
-func routeGroup(channel uint8, seqLo uint16, srcSID uint32, opus []byte,
-	speaker *topology.Session, state *topology.State, conn *net.UDPConn) {
+// routeViaRouter dispatches a group/CC packet through the pure routing
+// function in package router. The router applies every business rule
+// (Prompt §Regras 1-8 + CC speak-permission): per-recipient mute,
+// channel-toggle override for leader/sub, remote-mute scope, whisper,
+// unified-mode rewrite, etc. Each Decision becomes one UDP egress
+// with the router's chosen EgressChan and per-recipient gain.
+//
+// Wire format is the same 10-byte header used by proximity:
+//     version | egressChan | seqLo | srcSID | gain | pan | opus
+// Gain is quantized from router.Volume (1.0 → 128, 2.0 → 255).
+// Pan is always 0 (group voice is centered; no spatial info).
+func routeViaRouter(channel uint8, seqLo uint16, srcSID uint32, opus []byte,
+	speaker *topology.Session, state *topology.State,
+	worldState *world.WorldState, conn *net.UDPConn) {
 
 	if len(opus) == 0 || speaker.PlayerID == 0 {
 		return
 	}
-	members, err := lookupGroupMembers(speaker.PlayerID, channel)
-	if err != nil {
-		if rxCount[srcSID]%50 == 1 {
-			log.Printf("audio: group lookup failed sid=%d ch=%d: %v",
-				srcSID, channel, err)
-		}
+	pkt := router.Packet{
+		SenderID:   speaker.PlayerID,
+		Channel:    world.Channel(channel),
+		InstanceID: speaker.InstanceID,
+		X:          speaker.X,
+		Y:          speaker.Y,
+		Z:          speaker.Z,
+	}
+	decisions := router.Route(pkt, worldState, router.DefaultConfig())
+	if rxCount[srcSID]%50 == 1 {
+		log.Printf("audio: sid=%d (pid=%d) ch=%d -> %d recipients via router",
+			srcSID, speaker.PlayerID, channel, len(decisions))
+	}
+	if len(decisions) == 0 {
 		return
 	}
-	if rxCount[srcSID]%50 == 1 {
-		log.Printf("audio: sid=%d (pid=%d) ch=%d group=%d members",
-			srcSID, speaker.PlayerID, channel, len(members))
-	}
+
 	out := make([]byte, 10+len(opus))
 	out[0] = 1
-	out[1] = channel
 	binary.LittleEndian.PutUint16(out[2:4], seqLo)
 	binary.LittleEndian.PutUint32(out[4:8], srcSID)
-	out[8] = 255   // gain
-	out[9] = 0     // pan (centered)
+	out[9] = 0 // pan centered for group voice
 	copy(out[10:], opus)
-	for _, pid := range members {
-		if pid == speaker.PlayerID {
-			continue
-		}
-		recv := state.LookupByPlayer(pid)
+
+	for _, d := range decisions {
+		recv := state.LookupByPlayer(d.RecipientID)
 		if recv == nil || recv.UDPAddr == nil {
 			continue
 		}
+		// Quantize router volume (0..2) to wire gain byte (0..255).
+		// 1.0 maps to 128 so there's headroom for boosted per-player
+		// volumes up to 2.0 (→ 255).
+		g := d.Volume * 128.0
+		if g > 255 {
+			g = 255
+		} else if g < 0 {
+			g = 0
+		}
+		out[1] = byte(d.EgressChan)
+		out[8] = byte(g)
 		_, _ = conn.WriteToUDP(out, recv.UDPAddr)
 	}
 }

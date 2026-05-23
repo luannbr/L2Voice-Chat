@@ -25,6 +25,8 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <algorithm>
+#include <chrono>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -69,6 +71,43 @@ bool ExtractNumber(const std::string& s, const char* key, uint64_t& out) {
     return true;
 }
 
+// Extracts a boolean field. Returns false when the key is absent or
+// the literal value is neither true nor false.
+bool ExtractBool(const std::string& s, const char* key, bool& out) {
+    std::string needle = std::string("\"") + key + "\":";
+    auto p = s.find(needle);
+    if (p == std::string::npos) return false;
+    p += needle.size();
+    if (s.compare(p, 4, "true") == 0)  { out = true;  return true; }
+    if (s.compare(p, 5, "false") == 0) { out = false; return true; }
+    return false;
+}
+
+// Slices the body of an array field. On success returns true and sets
+// [body_start, body_end) to the inclusive-exclusive bounds of the
+// content between the brackets. Brace-depth-aware so nested {} inside
+// objects don't confuse it.
+bool ExtractArrayBody(const std::string& s, const char* key,
+                      size_t& body_start, size_t& body_end) {
+    std::string needle = std::string("\"") + key + "\":[";
+    auto p = s.find(needle);
+    if (p == std::string::npos) return false;
+    p += needle.size();
+    body_start = p;
+    int depth = 0;
+    while (p < s.size()) {
+        char c = s[p];
+        if (c == '{') ++depth;
+        else if (c == '}') --depth;
+        else if (c == ']' && depth == 0) {
+            body_end = p;
+            return true;
+        }
+        ++p;
+    }
+    return false;
+}
+
 }  // namespace
 
 struct VoiceNetwork::Impl {
@@ -85,6 +124,7 @@ struct VoiceNetwork::Impl {
 
     AuthOkCallback on_auth;
     PacketCallback on_packet;
+    WsOpenCallback on_ws_open;   // fires inside the IXWebSocket Open handler
 
     SOCKET udp_sock = INVALID_SOCKET;
     sockaddr_in udp_dest{};
@@ -97,6 +137,42 @@ struct VoiceNetwork::Impl {
     std::mutex names_mu;
     std::unordered_map<uint32_t, std::string> name_cache;
     std::unordered_map<uint32_t, bool> name_query_inflight;
+
+    // player_id → name (separate cache, populated by player_name_result).
+    std::unordered_map<uint32_t, std::string> player_name_cache;
+    std::unordered_map<uint32_t, bool>        player_name_inflight;
+
+    // ---- Notification toasts (server-pushed) ---------------------
+    mutable std::mutex            toasts_mu;
+    std::vector<VoiceNetwork::Toast> toasts;
+    std::atomic<uint32_t>         next_toast_id{1};
+    void AddToast(const char* text, uint8_t severity, int64_t ttl_ms);
+
+    // ---- WS ping/pong (RTT measurement) --------------------------
+    // Uses steady_clock so wall-clock changes don't pollute. The
+    // last-sent timestamp doubles as the in-flight token; the server
+    // echoes it back in "pong" and we subtract to get RTT.
+    std::atomic<int64_t> last_ping_sent_ms{0};
+    std::atomic<int>     last_rtt_ms{-1};
+
+    // ---- client_state snapshot (Phase D server push) -------------
+    // Mutex covers the entire blob since the overlay reads via copy.
+    std::mutex                                 state_mu;
+    uint8_t   cs_role{0};
+    uint32_t  cs_clan_id{0};
+    uint32_t  cs_ally_id{0};
+    uint64_t  cs_party_id{0};
+    uint32_t  cs_cc_id{0};
+    uint32_t  cs_cc_leader_id{0};
+    bool      cs_cc_can_speak{false};
+    uint8_t   cs_clan_mode{0};
+    bool      cs_opted_out{false};
+    std::vector<VoiceNetwork::GroupMember> cs_party_members;
+    std::vector<VoiceNetwork::GroupMember> cs_clan_members;
+    std::vector<VoiceNetwork::GroupMember> cs_ally_members;
+    std::vector<VoiceNetwork::GroupMember> cs_cc_members;
+    void HandleClientStateImpl(const std::string& s);
+    void HandleNotification(const std::string& s);
 
     bool InitWinsock() {
         WSADATA wsa;
@@ -146,15 +222,19 @@ struct VoiceNetwork::Impl {
             uint8_t gain = 255;
             int8_t  pan  = 0;
 
-            if (channel == 0) {                 // proximity, 10-byte header
+            // All audio channels use a uniform 10-byte header:
+            //     v(1) | ch(1) | seq(2) | sid(4) | gain(1) | pan(1) | opus...
+            // Egress channel mapping:
+            //   0 proximity, 1 party, 2 clan, 3 ally, 4 CC, 8 mode-unified.
+            // (5/6/7 are control frames — never carry audio on egress.)
+            if (channel == 0 ||
+                (channel >= 1 && channel <= 4) ||
+                channel == 8) {
                 if (n < 10) continue;
                 gain = buf[8];
                 pan  = (int8_t)buf[9];
                 opus = buf + 10;
                 opus_len = (uint16_t)(n - 10);
-            } else if (channel >= 1 && channel <= 4) {  // party/clan/ally/siege
-                opus = buf + 8;
-                opus_len = (uint16_t)(n - 8);
             } else if (channel == 7) {          // ping_resp
                 continue;
             } else {
@@ -180,6 +260,10 @@ struct VoiceNetwork::Impl {
                 case ix::WebSocketMessageType::Open:
                     connected.store(true);
                     auth_sent.store(false);
+                    // Snapshot fresh per-session state (e.g. TCP port
+                    // list) before the immediate TrySendAuth so the
+                    // FIRST attempt on each reconnect can succeed.
+                    if (on_ws_open) on_ws_open();
                     TrySendAuth();
                     break;
                 case ix::WebSocketMessageType::Close:
@@ -237,6 +321,45 @@ struct VoiceNetwork::Impl {
                 if (!nm.empty()) {
                     name_cache[(uint32_t)sid_u] = nm;
                 }
+            }
+            return;
+        }
+        // player_name_result {type, player_id, name}
+        if (s.find("\"player_name_result\"") != std::string::npos) {
+            uint64_t pid = 0;
+            std::string nm;
+            ExtractNumber(s, "player_id", pid);
+            ExtractString(s, "name", nm);
+            {
+                std::lock_guard<std::mutex> lk(names_mu);
+                player_name_inflight.erase((uint32_t)pid);
+                if (!nm.empty()) player_name_cache[(uint32_t)pid] = nm;
+            }
+            return;
+        }
+        if (s.find("\"client_state\"") != std::string::npos) {
+            HandleClientStateImpl(s);
+            return;
+        }
+        // notification {type, subtype, from, scope, muted, ...}
+        // Currently the server emits subtype="remotely_muted_by" when
+        // a clan leader/sub mutes (or unmutes) a member. The DLL queues
+        // a toast with the human-readable text; the overlay renders.
+        if (s.find("\"notification\"") != std::string::npos) {
+            HandleNotification(s);
+            return;
+        }
+        // pong {type, t}: t is whatever we sent in the corresponding
+        // ping (a steady_clock ms). Diff against "now" = round-trip.
+        if (s.find("\"pong\"") != std::string::npos) {
+            uint64_t t_echo = 0;
+            if (ExtractNumber(s, "t", t_echo)) {
+                auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                int rtt = (int)(now_ms - (int64_t)t_echo);
+                if (rtt < 0) rtt = 0;
+                if (rtt > 99999) rtt = 99999;
+                last_rtt_ms.store(rtt);
             }
             return;
         }
@@ -299,6 +422,29 @@ bool VoiceNetwork::Start(const char* ws_url, AuthOkCallback on_auth,
     impl_->udp_thread = std::thread([this] { impl_->UdpLoop(); });
     impl_->StartWs();
     return true;
+}
+
+void VoiceNetwork::SetWsOpenHook(WsOpenCallback on_open) {
+    impl_->on_ws_open = std::move(on_open);
+}
+
+void VoiceNetwork::SuspendWs() {
+    if (!impl_) return;
+    // Disable auto-reconnect first; otherwise stop() triggers the
+    // close handler which would just bounce back via setOnMessage's
+    // automatic-reconnect path.
+    impl_->ws.disableAutomaticReconnection();
+    impl_->ws.stop();
+    impl_->connected.store(false);
+    impl_->auth_sent.store(false);
+    impl_->session_id.store(0);
+    impl_->udp_port.store(0);
+}
+
+void VoiceNetwork::ResumeWs() {
+    if (!impl_) return;
+    impl_->ws.enableAutomaticReconnection();
+    impl_->ws.start();
 }
 
 void VoiceNetwork::Stop() {
@@ -378,6 +524,123 @@ void VoiceNetwork::SendGroupFrame(uint8_t channel, uint16_t seq,
            (sockaddr*)&impl_->udp_dest, sizeof(impl_->udp_dest));
 }
 
+void VoiceNetwork::SendPingTick() {
+    if (!impl_->connected.load()) return;
+    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    // Throttle to ~once per 2 s — caller can hammer this from the
+    // render loop without worry.
+    int64_t last = impl_->last_ping_sent_ms.load();
+    if (now_ms - last < 2000) return;
+    impl_->last_ping_sent_ms.store(now_ms);
+    std::string s = "{\"type\":\"ping\",\"t\":";
+    s += std::to_string(now_ms);
+    s += "}";
+    impl_->ws.send(s);
+}
+
+int VoiceNetwork::LastPingMs() const {
+    return impl_->last_rtt_ms.load();
+}
+
+// Builds a Toast and pushes it into the queue. Older toasts past their
+// TTL are pruned opportunistically here so the buffer stays bounded.
+void VoiceNetwork::Impl::AddToast(const char* text, uint8_t severity, int64_t ttl_ms) {
+    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    VoiceNetwork::Toast t{};
+    t.id = next_toast_id.fetch_add(1);
+    _snprintf_s(t.text, _TRUNCATE, "%s", text);
+    t.severity   = severity;
+    t.created_ms = now_ms;
+    t.dismiss_ms = now_ms + ttl_ms;
+    std::lock_guard<std::mutex> lk(toasts_mu);
+    // Prune expired entries first.
+    toasts.erase(std::remove_if(toasts.begin(), toasts.end(),
+        [now_ms](const VoiceNetwork::Toast& x){ return x.dismiss_ms <= now_ms; }),
+        toasts.end());
+    // Cap to last 5 — voice notifications shouldn't ever flood.
+    while (toasts.size() >= 5) toasts.erase(toasts.begin());
+    toasts.push_back(t);
+}
+
+// Handles a notification frame. Currently only "remotely_muted_by".
+// Format: {"type":"notification","subtype":"remotely_muted_by",
+//          "from":<pid>,"scope":"clan"|"ally","muted":bool}
+void VoiceNetwork::Impl::HandleNotification(const std::string& s) {
+    // subtype
+    std::string subtype;
+    ExtractString(s, "subtype", subtype);
+    if (subtype == "remotely_muted_by") {
+        uint64_t from = 0;
+        ExtractNumber(s, "from", from);
+        std::string scope;
+        ExtractString(s, "scope", scope);
+        bool muted = true;
+        ExtractBool(s, "muted", muted);
+
+        // Resolve the muter's name via the existing player-name cache
+        // (async — first call kicks off a query; on next notification
+        // we have the name). For the immediate toast, fall back to
+        // "pid=N" if unresolved.
+        char muterName[64] = "?";
+        {
+            std::lock_guard<std::mutex> lk(names_mu);
+            auto it = player_name_cache.find((uint32_t)from);
+            if (it != player_name_cache.end() && !it->second.empty()) {
+                _snprintf_s(muterName, _TRUNCATE, "%s", it->second.c_str());
+            } else {
+                _snprintf_s(muterName, _TRUNCATE, "pid=%llu", (unsigned long long)from);
+            }
+        }
+        // Kick off a name query so the SECOND notification can use the
+        // resolved name (this one may show pid=N if first-sight).
+        if (player_name_cache.find((uint32_t)from) == player_name_cache.end()
+            && player_name_inflight.find((uint32_t)from) == player_name_inflight.end()) {
+            player_name_inflight[(uint32_t)from] = true;
+            std::string q = "{\"type\":\"player_name_query\",\"player_id\":";
+            q += std::to_string(from);
+            q += "}";
+            ws.send(q);
+        }
+
+        char buf[192];
+        if (muted) {
+            _snprintf_s(buf, _TRUNCATE,
+                "You were muted on %s by %s",
+                scope.empty() ? "clan" : scope.c_str(), muterName);
+        } else {
+            _snprintf_s(buf, _TRUNCATE,
+                "%s unmuted you on %s",
+                muterName, scope.empty() ? "clan" : scope.c_str());
+        }
+        // Mute = error/warn, unmute = success.
+        AddToast(buf, muted ? 2 : 3, 6000 /*ms*/);
+    } else {
+        // Forward-compat: unknown subtype gets a generic info toast.
+        AddToast(("notification: " + subtype).c_str(), 0, 4000);
+    }
+}
+
+size_t VoiceNetwork::GetToasts(Toast* out, size_t cap) const {
+    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    std::lock_guard<std::mutex> lk(impl_->toasts_mu);
+    // Don't prune from a const accessor — just skip the expired ones
+    // here. The producer (AddToast) prunes opportunistically.
+    size_t written = 0;
+    for (const Toast& t : impl_->toasts) {
+        if (t.dismiss_ms <= now_ms) continue;
+        if (cap == 0 || out == nullptr) {
+            ++written;
+            continue;
+        }
+        if (written >= cap) break;
+        out[written++] = t;
+    }
+    return written;
+}
+
 void VoiceNetwork::SendKeepalive() {
     if (impl_->udp_port.load() == 0) return;
     uint8_t pkt[8];
@@ -404,6 +667,272 @@ void VoiceNetwork::SendNameQuery(uint32_t src_id) {
     s += std::to_string(src_id);
     s += "}";
     impl_->ws.send(s);
+}
+
+// ----- Phase C: clan-voice control commands ------------------------
+//
+// All senders build the JSON inline to avoid pulling a JSON dep into
+// the DLL just for tiny one-shot messages. ws.send is thread-safe per
+// IXWebSocket's contract.
+
+namespace {
+std::string ftos(float v) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%.3f", v);
+    return std::string(buf);
+}
+}
+
+void VoiceNetwork::SendSetChannelEnabled(uint8_t channel, bool enabled) {
+    if (!impl_->connected.load()) return;
+    std::string s = "{\"type\":\"set_channel_enabled\",\"channel\":";
+    s += std::to_string((int)channel);
+    s += ",\"enabled\":";
+    s += enabled ? "true" : "false";
+    s += "}";
+    impl_->ws.send(s);
+}
+
+void VoiceNetwork::SendSetChannelVolume(uint8_t channel, float volume) {
+    if (!impl_->connected.load()) return;
+    std::string s = "{\"type\":\"set_channel_volume\",\"channel\":";
+    s += std::to_string((int)channel);
+    s += ",\"volume\":";
+    s += ftos(volume);
+    s += "}";
+    impl_->ws.send(s);
+}
+
+void VoiceNetwork::SendSetPlayerMute(uint32_t target_player_id, bool muted) {
+    if (!impl_->connected.load() || target_player_id == 0) return;
+    std::string s = "{\"type\":\"set_player_mute\",\"target_id\":";
+    s += std::to_string(target_player_id);
+    s += ",\"muted\":";
+    s += muted ? "true" : "false";
+    s += "}";
+    impl_->ws.send(s);
+}
+
+void VoiceNetwork::SendSetPlayerVolume(uint32_t target_player_id, float volume) {
+    if (!impl_->connected.load() || target_player_id == 0) return;
+    std::string s = "{\"type\":\"set_player_volume\",\"target_id\":";
+    s += std::to_string(target_player_id);
+    s += ",\"volume\":";
+    s += ftos(volume);
+    s += "}";
+    impl_->ws.send(s);
+}
+
+void VoiceNetwork::SendClanSetMode(uint8_t mode) {
+    if (!impl_->connected.load()) return;
+    std::string s = "{\"type\":\"clan_set_mode\",\"mode\":";
+    s += std::to_string((int)mode);
+    s += "}";
+    impl_->ws.send(s);
+}
+
+void VoiceNetwork::SendWhisperSet(uint8_t mode, int vk) {
+    if (!impl_->connected.load()) return;
+    std::string s = "{\"type\":\"whisper_set\",\"mode\":";
+    s += std::to_string((int)mode);
+    s += ",\"key\":";
+    s += std::to_string(vk);
+    s += "}";
+    impl_->ws.send(s);
+}
+
+void VoiceNetwork::SendClanPromoteSubLeader(uint32_t target_player_id, bool promote) {
+    if (!impl_->connected.load() || target_player_id == 0) return;
+    std::string s = "{\"type\":\"";
+    s += promote ? "clan_promote_subleader" : "clan_demote_subleader";
+    s += "\",\"target_id\":";
+    s += std::to_string(target_player_id);
+    s += "}";
+    impl_->ws.send(s);
+}
+
+void VoiceNetwork::SendClanRemoteMute(uint32_t target_player_id, bool muted, const char* scope) {
+    if (!impl_->connected.load() || target_player_id == 0 || !scope) return;
+    std::string s = "{\"type\":\"clan_remote_mute\",\"target_id\":";
+    s += std::to_string(target_player_id);
+    s += ",\"muted\":";
+    s += muted ? "true" : "false";
+    s += ",\"scope\":\"";
+    s += scope;
+    s += "\"}";
+    impl_->ws.send(s);
+}
+
+void VoiceNetwork::SendCCGrantSpeak(uint32_t target_player_id, bool granted) {
+    if (!impl_->connected.load() || target_player_id == 0) return;
+    std::string s = "{\"type\":\"cc_grant_speak\",\"target_id\":";
+    s += std::to_string(target_player_id);
+    s += ",\"granted\":";
+    s += granted ? "true" : "false";
+    s += "}";
+    impl_->ws.send(s);
+}
+
+void VoiceNetwork::SendClanOptOutUnified(bool opt_out) {
+    if (!impl_->connected.load()) return;
+    std::string s = "{\"type\":\"clan_opt_out_unified\",\"opt_out\":";
+    s += opt_out ? "true" : "false";
+    s += "}";
+    impl_->ws.send(s);
+}
+
+// ----- client_state parsing + accessors ----------------------------
+
+namespace {
+// Parses a single member object body (between { and }) starting at
+// `body[pos..]`. Returns the offset past the closing '}'. Fills out
+// the GroupMember from id/voice_active/role/can_speak keys; absent
+// keys default to zero/false.
+size_t ParseMemberObject(const std::string& body, size_t pos,
+                         VoiceNetwork::GroupMember& m) {
+    // Locate the enclosing braces.
+    while (pos < body.size() && body[pos] != '{') ++pos;
+    if (pos >= body.size()) return std::string::npos;
+    size_t start = pos;
+    int depth = 0;
+    size_t end = pos;
+    for (; end < body.size(); ++end) {
+        if (body[end] == '{') ++depth;
+        else if (body[end] == '}') {
+            --depth;
+            if (depth == 0) { ++end; break; }
+        }
+    }
+    if (depth != 0) return std::string::npos;
+    std::string obj(body, start, end - start);
+    m = {};
+    uint64_t v = 0;
+    if (ExtractNumber(obj, "id", v))    m.player_id = (uint32_t)v;
+    bool b = false;
+    if (ExtractBool(obj, "voice_active", b)) m.voice_active = b;
+    if (ExtractNumber(obj, "role", v)) m.clan_role = (uint8_t)v;
+    if (ExtractBool(obj, "can_speak", b)) m.cc_can_speak = b;
+    if (ExtractBool(obj, "remote_muted", b)) m.remote_muted = b;
+    return end;
+}
+
+void ParseMemberArray(const std::string& s, const char* key,
+                      std::vector<VoiceNetwork::GroupMember>& out) {
+    out.clear();
+    size_t bs = 0, be = 0;
+    if (!ExtractArrayBody(s, key, bs, be)) return;
+    std::string body(s, bs, be - bs);
+    size_t pos = 0;
+    while (pos < body.size()) {
+        VoiceNetwork::GroupMember m{};
+        size_t next = ParseMemberObject(body, pos, m);
+        if (next == std::string::npos) break;
+        if (m.player_id != 0) out.push_back(m);
+        pos = next;
+    }
+}
+} // namespace
+
+void VoiceNetwork::Impl::HandleClientStateImpl(const std::string& s) {
+    uint64_t v = 0;
+    uint8_t role = 0; uint32_t clan = 0, ally = 0, cc = 0, ccLeader = 0;
+    uint64_t party = 0;
+    bool ccCanSpeak = false; uint8_t mode = 0; bool optedOut = false;
+    if (ExtractNumber(s, "role",         v)) role     = (uint8_t)v;
+    if (ExtractNumber(s, "clan_id",      v)) clan     = (uint32_t)v;
+    if (ExtractNumber(s, "ally_id",      v)) ally     = (uint32_t)v;
+    if (ExtractNumber(s, "party_id",     v)) party    = v;
+    if (ExtractNumber(s, "cc_id",        v)) cc       = (uint32_t)v;
+    if (ExtractNumber(s, "cc_leader_id", v)) ccLeader = (uint32_t)v;
+    ExtractBool(s, "cc_can_speak", ccCanSpeak);
+    if (ExtractNumber(s, "clan_mode",    v)) mode     = (uint8_t)v;
+    ExtractBool(s, "opted_out", optedOut);
+
+    std::vector<GroupMember> party_m, clan_m, ally_m, cc_m;
+    ParseMemberArray(s, "party_members", party_m);
+    ParseMemberArray(s, "clan_members",  clan_m);
+    ParseMemberArray(s, "ally_members",  ally_m);
+    ParseMemberArray(s, "cc_members",    cc_m);
+
+    {
+        char dbg[256];
+        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+            "[l2voice] client_state: role=%u clan=%u ally=%u party=%llu cc=%u "
+            "members(party/clan/ally/cc)=%zu/%zu/%zu/%zu\n",
+            (unsigned)role, clan, ally,
+            (unsigned long long)party, cc,
+            party_m.size(), clan_m.size(), ally_m.size(), cc_m.size());
+        OutputDebugStringA(dbg);
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(state_mu);
+        cs_role = role;
+        cs_clan_id = clan;
+        cs_ally_id = ally;
+        cs_party_id = party;
+        cs_cc_id = cc;
+        cs_cc_leader_id = ccLeader;
+        cs_cc_can_speak = ccCanSpeak;
+        cs_clan_mode = mode;
+        cs_opted_out = optedOut;
+        cs_party_members = std::move(party_m);
+        cs_clan_members  = std::move(clan_m);
+        cs_ally_members  = std::move(ally_m);
+        cs_cc_members    = std::move(cc_m);
+    }
+}
+
+size_t VoiceNetwork::GetGroupMembers(uint8_t group, GroupMember* out, size_t cap) const {
+    std::lock_guard<std::mutex> lk(impl_->state_mu);
+    const std::vector<GroupMember>* src = nullptr;
+    switch (group) {
+        case 1: src = &impl_->cs_party_members; break;
+        case 2: src = &impl_->cs_clan_members;  break;
+        case 3: src = &impl_->cs_ally_members;  break;
+        case 4: src = &impl_->cs_cc_members;    break;
+        default: return 0;
+    }
+    size_t n = src->size();
+    if (cap == 0 || out == nullptr) return n;
+    if (n > cap) n = cap;
+    for (size_t i = 0; i < n; ++i) out[i] = (*src)[i];
+    return n;
+}
+
+uint8_t VoiceNetwork::LocalRole()         const { std::lock_guard<std::mutex> lk(impl_->state_mu); return impl_->cs_role; }
+uint32_t VoiceNetwork::LocalClanID()      const { std::lock_guard<std::mutex> lk(impl_->state_mu); return impl_->cs_clan_id; }
+uint32_t VoiceNetwork::LocalAllyID()      const { std::lock_guard<std::mutex> lk(impl_->state_mu); return impl_->cs_ally_id; }
+uint64_t VoiceNetwork::LocalPartyID()     const { std::lock_guard<std::mutex> lk(impl_->state_mu); return impl_->cs_party_id; }
+uint32_t VoiceNetwork::LocalCCID()        const { std::lock_guard<std::mutex> lk(impl_->state_mu); return impl_->cs_cc_id; }
+uint32_t VoiceNetwork::LocalCCLeaderID()  const { std::lock_guard<std::mutex> lk(impl_->state_mu); return impl_->cs_cc_leader_id; }
+bool     VoiceNetwork::LocalCCCanSpeak()  const { std::lock_guard<std::mutex> lk(impl_->state_mu); return impl_->cs_cc_can_speak; }
+uint8_t  VoiceNetwork::LocalClanMode()    const { std::lock_guard<std::mutex> lk(impl_->state_mu); return impl_->cs_clan_mode; }
+
+void VoiceNetwork::SendPlayerNameQuery(uint32_t player_id) {
+    if (!impl_->connected.load() || player_id == 0) return;
+    {
+        std::lock_guard<std::mutex> lk(impl_->names_mu);
+        if (impl_->player_name_cache.count(player_id)) return;
+        if (impl_->player_name_inflight.count(player_id)) return;
+        impl_->player_name_inflight[player_id] = true;
+    }
+    std::string s = "{\"type\":\"player_name_query\",\"player_id\":";
+    s += std::to_string(player_id);
+    s += "}";
+    impl_->ws.send(s);
+}
+
+bool VoiceNetwork::CachedPlayerName(uint32_t player_id, char* out, size_t cap) {
+    if (cap == 0) return false;
+    std::lock_guard<std::mutex> lk(impl_->names_mu);
+    auto it = impl_->player_name_cache.find(player_id);
+    if (it == impl_->player_name_cache.end()) { out[0] = 0; return false; }
+    size_t n = it->second.size();
+    if (n >= cap) n = cap - 1;
+    memcpy(out, it->second.data(), n);
+    out[n] = 0;
+    return true;
 }
 
 bool VoiceNetwork::CachedName(uint32_t src_id, char* out, size_t cap) {

@@ -1,93 +1,181 @@
-# Voice System for L2 Essence 542
+# L2Voice-Chat
 
-Three-channel voice chat integrated into the L2 client: proximity (3D
-positional), party (closed group), clan/ally (global). Ships as its
-own DLL — **`l2voice.dll`**, separate from `l2ui.dll` (AutoLogin).
-Both can be injected side-by-side via the Engine.dll IAT method.
+In-game voice chat for Lineage II private servers. Three channels —
+**Proximity** (3D positional), **Party**, **Clan/Ally** — wired into
+the L2 client via a side-loaded DLL plus a small Go relay and a Java
+bridge for L2J-family game servers.
 
-## Target
+**🇧🇷 Versão em português:** [README.pt-BR.md](README.pt-BR.md)
 
-- **Client:** L2 Essence 542 SamuraiCrow (EU build) — `engine.dll` TS=0x6928282b
-- **Server:** L2J l2emuproject Essence (this source: `Source-GS_SR-542-main`)
-- **Voice service:** Go, runs initially on the dev box; deployable to Linux VPS later
+---
 
-## Architecture
+## ⚠️ Disclaimer
+
+This project is **not affiliated with, endorsed by, or sponsored by
+NCSoft**. "Lineage II" is a trademark of NCSoft Corporation.
+
+This software is intended **exclusively for use on private servers**
+that you operate or are authorized to participate in. Using it on
+official NCSoft servers may violate their Terms of Service. The
+authors take no responsibility for accounts, characters, or actions
+taken by third parties using this software.
+
+The repository contains **no copyrighted game assets** — UI textures
+referenced by the optional `VOICE_L2_THEME` build flag are not
+distributed and must be supplied by the user from a client they own.
+
+Use at your own risk.
+
+---
+
+## What it looks like
+
+Pipeline at a glance:
 
 ```
-┌─────────────────────┐         ┌──────────────────────┐         ┌─────────────┐
-│  Cliente L2 + DLL   │◄───────►│  Serviço de Voz (Go) │◄───────►│   L2J Core  │
-│  (C++, MSVC v143)   │  UDP    │   SFU + Mixer        │  Redis  │  (Java 17)  │
-│  l2voice.dll        │  audio  │   :17666 udp         │  pub/sub│  + bridge   │
-│  (standalone)       │  WS     │   :17667 ws          │         │  module     │
-│                     │  ctrl   │                      │         │  :17668 http│
-└─────────────────────┘         └──────────────────────┘         └─────────────┘
+┌────────────────────┐         ┌──────────────────────┐         ┌──────────────┐
+│  L2 client + DLL   │◄───────►│  voice-server (Go)   │◄───────►│  L2J bridge  │
+│  l2voice.dll       │  UDP    │  SFU + spatial mix   │   WS    │  (Java 17)   │
+│  (C++17, Win32)    │  audio  │  :17666 udp          │ events  │  Maven mod   │
+│                    │  WS     │  :17667 ws           │ + RPC   │              │
+│                    │  ctrl   │                      │         │              │
+└────────────────────┘         └──────────────────────┘         └──────────────┘
 ```
 
-See `docs/protocol.md` for wire formats.
+- **Client DLL** — captures from WASAPI, runs AEC (Speex DSP) +
+  NS (RNNoise) + AGC + HPF, encodes Opus, sends over UDP. ImGui
+  overlay for channel/PTT/volume controls.
+- **voice-server** — single Go binary. Authoritative routing,
+  proximity math, per-channel mixdown. WebSocket control plane;
+  UDP audio plane.
+- **l2j-bridge** — Maven module attached to a L2J-family game
+  server. Resolves player identity from a TCP-port snapshot, fans
+  party/clan/ally events into the voice-server, and answers RPC
+  whoami/name queries.
 
-## Layout
+The three pieces talk over documented protocols — see
+[`docs/protocol.md`](docs/protocol.md) for the wire format.
 
-```
-Voice_System/
-├── Prompt.txt             original brief
-├── README.md              this file
-├── docs/
-│   └── protocol.md        binary UDP + WS JSON + Redis pub/sub spec
-├── client/                STANDALONE DLL → l2voice.dll
-│   ├── CMakeLists.txt     top-level build
-│   ├── dllmain.cpp        entry point + 50 Hz poll thread
-│   └── voice/             module: capture, playback, codec, net, memreader
-├── voice-service/         Go service (standalone)
-│   ├── cmd/voice-server/  main package
-│   └── internal/          audio router, topology, auth
-└── l2j-bridge/            Java module attached to l2emuproject Essence 542 GS
-```
+## Features
+
+- **Three voice channels.** Proximity (positional), Party (closed
+  group), Clan/Ally (global). PTT priority: party > clan > ally >
+  proximity.
+- **Full audio processing chain.** AEC → HPF → NS → AGC. Cuts echo
+  during dual-PC setups and keyboard/mouse noise during raids.
+- **No client identity protocol.** The DLL doesn't ship a token.
+  Identity is resolved server-side by matching the DLL's TCP source
+  ports against the GS's accepted sockets — works with any L2J
+  fork without server-side hooks beyond the bridge module.
+- **Multi-VPS ready.** The bridge can fan events to N voice-servers
+  in parallel; clients connect to the nearest one by URL.
+- **No GPL anywhere in the runtime.** Everything ships under MIT/BSD
+  permissive licenses, including all bundled native dependencies.
 
 ## Tech stack
 
-| Component | Library | Why |
-|-----------|---------|-----|
-| client / capture/playback | [miniaudio](https://github.com/mackron/miniaudio) | MIT/Unlicense, single header, WASAPI on Win |
-| client / codec | [Opus](https://opus-codec.org/) | BSD, low latency, 24 kbps target |
-| client / net (UDP audio) | raw `WinSock2` | no deps, our own protocol |
-| client / net (WS control) | [IXWebSocket](https://github.com/machinezone/IXWebSocket) or `websocketpp` | BSD/MIT |
-| client / UI | ImGui (already present) | already in DLL |
-| voice-service | `gorilla/websocket`, `redis/go-redis`, stdlib `net` | MIT/BSD |
-| l2j-bridge | adapts to whatever the GS source uses; Redis client `jedis` | BSD |
+| Component | Library | License |
+|-----------|---------|---------|
+| Capture/playback | [miniaudio](https://github.com/mackron/miniaudio) | MIT/Unlicense |
+| Opus codec | [libopus](https://opus-codec.org/) | BSD |
+| Echo cancellation | [Speex DSP](https://github.com/xiph/speexdsp) | BSD |
+| Noise suppression | [RNNoise](https://github.com/xiph/rnnoise) (cpuimage MSVC fork) | BSD |
+| WebSocket | [IXWebSocket](https://github.com/machinezone/IXWebSocket) | BSD |
+| Hooking | [MinHook](https://github.com/TsudaKageyu/minhook) | BSD-2-Clause |
+| Overlay | [Dear ImGui](https://github.com/ocornut/imgui) | MIT |
+| voice-server | gorilla/websocket, redis/go-redis, stdlib net | MIT/BSD |
+| l2j-bridge | Jedis (Redis client) | MIT |
 
-**No GPL** anywhere — confirmed for distributable build.
+## Quick start
+
+If you just want to get it running locally:
+
+```bash
+# 1. Build the voice-server (needs Go 1.22+)
+cd voice-service && go mod tidy && go build -o voice-server.exe ./cmd/voice-server
+./voice-server.exe -udp :17666 -ws :17667
+
+# 2. Build the DLL (needs VS2022 + CMake 3.20+)
+cd client
+cmake -S . -B build -G "Visual Studio 17 2022" -A Win32
+cmake --build build --config Release
+# → client/build/Release/l2voice.dll
+
+# 3. Drop the DLL next to your L2 client + create voice.ini
+#    (see docs/USAGE.md for full ini reference)
+
+# 4. Build the L2J bridge JAR (needs JDK 17 + Maven + your server JARs)
+cd l2j-bridge && mvn package
+```
+
+Full step-by-step guides:
+
+- 🇺🇸 [**docs/BUILDING.md**](docs/BUILDING.md) — compile all three components
+- 🇺🇸 [**docs/USAGE.md**](docs/USAGE.md) — install, configure, and operate
+- 🇧🇷 [**docs/BUILDING.pt-BR.md**](docs/BUILDING.pt-BR.md) — guia de compilação
+- 🇧🇷 [**docs/USAGE.pt-BR.md**](docs/USAGE.pt-BR.md) — guia de uso
+
+## Compatibility
+
+| L2 client | Status |
+|-----------|--------|
+| Essence 542 SamuraiCrow (EU) | ✅ verified |
+| Other Essence builds | ⚠️ likely works — engine offsets may differ |
+| Interlude | ⚠️ DLL injects, name capture limited (see notes) |
+| Other chronicles | ❌ untested |
+
+| L2J fork | Status |
+|----------|--------|
+| l2emuproject Essence 542 | ✅ verified |
+| Other L2J Essence forks | ⚠️ bridge needs minor API adaptation |
+| Mainstream L2J / aCis / etc. | ⚠️ bridge needs L2World API porting |
+
+## Project layout
+
+```
+.
+├── LICENSE                  MIT
+├── README.md                this file (English)
+├── README.pt-BR.md          Portuguese version
+├── docs/
+│   ├── protocol.md          wire format (UDP audio + WS control + RPC)
+│   ├── BUILDING.md          build guide (EN)
+│   ├── BUILDING.pt-BR.md    guia de compilação
+│   ├── USAGE.md             usage guide (EN)
+│   ├── USAGE.pt-BR.md       guia de uso
+│   └── DESIGN.pt-BR.md      original design brief (Portuguese)
+├── client/                  l2voice.dll (C++17, Win32, MSVC)
+│   ├── CMakeLists.txt
+│   ├── dllmain.cpp
+│   └── voice/               capture/playback/codec/net/overlay/apm
+├── voice-service/           voice-server (Go 1.22+)
+│   ├── cmd/voice-server/
+│   └── internal/
+└── l2j-bridge/              Maven module (JDK 17)
+    └── src/main/java/com/luannbr/l2voice/bridge/
+```
 
 ## Status
 
 | Phase | Description | Status |
 |-------|-------------|--------|
-| 1     | Monorepo structure + protocol doc | ✅ approved |
-| 2     | Proximity-only voice module in DLL | in progress |
-| 3     | Go voice-service for proximity | in progress |
-| 4     | L2J bridge (skeleton + Redis pub/sub + HTTP validate) | in progress |
-| 5     | Special cases (Olympiad/siege/multibox/death) | pending |
+| 1 | Monorepo + protocol doc | ✅ |
+| 2 | Proximity voice in DLL | ✅ |
+| 3 | Go voice-service (proximity + groups) | ✅ |
+| 4 | L2J bridge (identity, events, RPC) | ✅ |
+| 5 | Audio processing chain (AEC + NS + AGC) | ✅ |
+| 6 | Clan voice w/ operational modes | ✅ MVP |
+| — | Olympiad / siege / multibox edge cases | ⏳ in progress |
 
-Scope reduced to **proximity only** for the first end-to-end demo; party/clan/ally come after proximity works.
+## Contributing
 
-## Build requirements
+Issues and PRs welcome. Before opening a large PR, please open an
+issue first to discuss scope. The codebase mixes English and
+Portuguese comments — English is preferred for new code.
 
-| Component | Tools |
-|-----------|-------|
-| `client/` | VS2022 + CMake 3.20+ (own project; see `client/README.md`) |
-| `voice-service/` | Go 1.22+ — install from https://go.dev/dl/ |
-| `l2j-bridge/` | JDK 17 + Maven (matches l2emuproject Essence build) |
+## License
 
-Run `voice-service` locally:
-```
-cd voice-service
-go mod tidy
-go build -o voice-server.exe ./cmd/voice-server
-./voice-server.exe -udp :17666 -ws :17667
-```
+MIT — see [LICENSE](LICENSE).
 
-## How to read this repo before contributing
-
-1. `Prompt.txt` — original brief
-2. `docs/protocol.md` — wire formats (read this BEFORE coding either side)
-3. `client/README.md` — how to build and inject `l2voice.dll`
-4. Existing memories under `~/.claude/projects/.../memory/` — known engine RVAs, injection method (Engine.dll IAT), gotchas
+Bundled dependencies retain their respective licenses (all permissive:
+MIT, BSD, BSD-2-Clause). No GPL code in the runtime.

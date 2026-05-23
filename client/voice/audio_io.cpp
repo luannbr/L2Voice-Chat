@@ -131,12 +131,26 @@ bool AudioCapture::IsRunning() const { return impl_->running; }
 
 // ---- AudioPlayback --------------------------------------------------
 
+// Post-mix mono ring buffer holding the most recent N samples of what
+// went to the speakers. Used as the AEC "far-end" reference. Sized at
+// ~200ms (kFrameSamples * 10) which comfortably exceeds the longest
+// expected WASAPI playback latency (~50ms) so the AEC adaptive filter
+// can find the echo within its tail window.
+constexpr uint32_t kAecRefRingSamples = kFrameSamples * 10;
+
 struct AudioPlayback::Impl {
     ma_device device{};
     std::mutex sources_mu;
     std::unordered_map<uint32_t, Source> sources;
     std::atomic<float> master_gain{1.0f};
     bool running = false;
+
+    // AEC reference ring (post-mix mono). Writer is the playback
+    // audio thread; reader is the capture audio thread. Single
+    // producer / single consumer.
+    int16_t aec_ref[kAecRefRingSamples] = {};
+    std::atomic<uint32_t> aec_wr{0};
+    std::mutex aec_mu;  // guards the pop side (reader) only
 
     // Equal-power pan: pan in [-1, +1] → (left, right) gains.
     static void PanGains(float pan, float& left, float& right) {
@@ -184,6 +198,18 @@ struct AudioPlayback::Impl {
             }
             src.last_mix = std::chrono::steady_clock::now();
         }
+
+        // Push the post-mix mono downmix into the AEC reference ring.
+        // (out[2i]+out[2i+1])/2 is what an L+R speakers-into-mono mic
+        // would pick up if the user were in a perfect echo chamber.
+        // Approximation is fine — the AEC filter adapts.
+        uint32_t wr = self->aec_wr.load(std::memory_order_relaxed);
+        for (ma_uint32 i = 0; i < frame_count; ++i) {
+            int32_t mix = ((int32_t)out[i * 2 + 0] +
+                           (int32_t)out[i * 2 + 1]) / 2;
+            self->aec_ref[(wr + i) % kAecRefRingSamples] = (int16_t)mix;
+        }
+        self->aec_wr.store(wr + frame_count, std::memory_order_release);
     }
 };
 
@@ -295,6 +321,30 @@ float AudioPlayback::GetSourceVolume(uint32_t src_id) {
     std::lock_guard<std::mutex> lk(impl_->sources_mu);
     auto it = impl_->sources.find(src_id);
     return it != impl_->sources.end() ? it->second.volume : 1.0f;
+}
+
+void AudioPlayback::PopPlaybackReference(int16_t* dst, uint32_t samples) {
+    // Return the most recent `samples` from the AEC ring. We use the
+    // tail of the ring (latest data) rather than a logical pop, so the
+    // ring naturally tracks the *current* playback frontier — the AEC
+    // adaptive filter handles the small skew between this frontier and
+    // what the mic actually hears.
+    std::lock_guard<std::mutex> lk(impl_->aec_mu);
+    uint32_t wr = impl_->aec_wr.load(std::memory_order_acquire);
+    if (wr < samples) {
+        // Not enough data yet — zero-fill. Happens right after
+        // device start.
+        uint32_t pre = samples - wr;
+        std::memset(dst, 0, pre * sizeof(int16_t));
+        for (uint32_t i = 0; i < wr; ++i) {
+            dst[pre + i] = impl_->aec_ref[i % kAecRefRingSamples];
+        }
+        return;
+    }
+    uint32_t start = wr - samples;
+    for (uint32_t i = 0; i < samples; ++i) {
+        dst[i] = impl_->aec_ref[(start + i) % kAecRefRingSamples];
+    }
 }
 
 }  // namespace voice

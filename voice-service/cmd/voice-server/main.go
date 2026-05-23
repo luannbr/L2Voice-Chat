@@ -37,6 +37,7 @@ func main() {
 	l2jName := flag.String("l2j-name", "http://127.0.0.1:17668/voice/name", "L2J bridge /voice/name URL for player_id → character name lookup (optional)")
 	l2jGroup := flag.String("l2j-group", "http://127.0.0.1:17668/voice/group", "L2J bridge /voice/group URL for party/clan/ally member lookup (required for channels 1-3)")
 	echo := flag.Bool("echo", false, "echo every proximity packet back to the sender (loopback test mode)")
+	multiboxMute := flag.Bool("multibox-mute", true, "suppress proximity playback between sessions sharing the same client IP (default true; set false for VPS/multibox test scenarios)")
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
@@ -47,8 +48,24 @@ func main() {
 	// topology stays for session lifecycle (UDP addr, sid alloc).
 	state := topology.NewState()
 	worldState := world.NewWorldState()
-	_ = worldState   // wired into social subscriber below; future
-	                 // phases wire it into audio router + WS control.
+	connReg := control.NewConnReg()
+
+	// Phase B: both Redis and bridge-WS event paths funnel through the
+	// same callbacks (push fresh client_state on any world change,
+	// close the WS when a player logs out). Build them once here and
+	// share between transports.
+	onStateChange := func(pid uint32) {
+		control.PushPlayerState(connReg, worldState, state, pid)
+	}
+	onPlayerLogout := func(pid uint32) {
+		if connReg.CloseByPlayer(pid) {
+			log.Printf("control: closed WS for player=%d (logged out)", pid)
+		}
+	}
+	control.SetBridgeEventHandler(func(payload []byte) {
+		social.HandleEvent(payload, state, worldState,
+			onStateChange, onPlayerLogout)
+	})
 
 	// Wire the L2J /voice/whoami endpoint. Required — voice-service can't
 	// resolve a WS connection's player_id without it.
@@ -62,17 +79,20 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	audioCfg := audio.Config{Echo: *echo}
+	audioCfg := audio.Config{Echo: *echo, MultiboxMute: *multiboxMute}
+	if !*multiboxMute {
+		log.Printf("audio: multibox-mute DISABLED — same-IP players will hear each other on proximity")
+	}
 	// UDP audio router runs in its own goroutine; cancelling ctx stops it.
 	go func() {
-		if err := audio.Serve(ctx, *udpAddr, state, audioCfg); err != nil {
+		if err := audio.Serve(ctx, *udpAddr, state, worldState, audioCfg); err != nil {
 			log.Fatalf("audio.Serve: %v", err)
 		}
 	}()
 
 	// WebSocket control plane runs in main goroutine; HTTP handler hosts /ws.
 	go func() {
-		if err := control.Serve(ctx, *wsAddr, state); err != nil {
+		if err := control.Serve(ctx, *wsAddr, state, worldState, connReg); err != nil {
 			log.Fatalf("control.Serve: %v", err)
 		}
 	}()
@@ -82,7 +102,7 @@ func main() {
 		go func() {
 			if err := social.Subscribe(ctx,
 				social.Config{Addr: *redisAddr, Channel: *redisChan},
-				state, worldState); err != nil {
+				state, worldState, onStateChange, onPlayerLogout); err != nil {
 				log.Printf("social.Subscribe exited: %v", err)
 			}
 		}()

@@ -4,3 +4,26 @@ build/
 voice-service/voice-server
 voice-service/voice-server.exe
 target/
+
+# User configs / secrets — never commit these.
+voice.ini
+l2voice.properties
+*.local.ini
+*.local.properties
+
+# L2 client assets — NCSoft IP. NOT distributed with this repo.
+# To use the optional VOICE_L2_THEME=ON build, supply your own
+# l2ui_assets/ folder from a client you own.
+l2ui_assets/
+
+# Generated / IDE
+.vs/
+.vscode/
+.idea/
+*.user
+CMakeCache.txt
+CMakeFiles/
+
+# Java/Maven leftovers
+*.class
+dependency-reduced-pom.xml

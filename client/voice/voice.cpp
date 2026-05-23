@@ -8,6 +8,7 @@
 // service stamps onto each packet.
 
 #include "voice.h"
+#include "apm.h"
 #include "audio_io.h"
 #include "opus_codec.h"
 #include "overlay.h"
@@ -33,8 +34,24 @@ namespace voice {
 
 namespace {
 
+// Per-channel listening prefs. Defaults: all enabled, all at 1.0.
+// Loaded from voice.ini on init (keys ch_enabled_N / ch_volume_N),
+// pushed to the voice-service on connect so it has the latest state.
+//
+// active_tx_channel is the destination the single PTT key (and the
+// always-on mode) transmits on. The legacy per-channel PTT keys
+// (ptt_party / ptt_clan / ptt_ally) still work — when held they
+// override active_tx_channel for that instant.
+struct ChannelPrefs {
+    bool  enabled[4]  = { true, true, true, true };
+    float volume[4]   = { 1.0f, 1.0f, 1.0f, 1.0f };
+    int   active_tx_channel = 0;   // 0=Proximity, 1=Party, 2=Clan, 3=Ally, 4=CC
+};
+
 struct Mod {
     Config cfg{};
+    ChannelPrefs ch_prefs;
+    Apm apm;
     std::atomic<bool> running{false};
     // Path to voice.ini next to the DLL — captured at Init so the
     // setters can write changes back without re-resolving each time.
@@ -91,11 +108,28 @@ void OnCaptureFrame(const int16_t* pcm, uint32_t samples) {
         return vk != 0 && (GetAsyncKeyState(vk) & 0x8000) != 0;
     };
     uint8_t channel = 0xFF;   // none
+    // Legacy explicit-key path still wins when held — power users keep
+    // multiple PTTs configured. Otherwise the main PTT (and always-on)
+    // route to the user's selected active TX channel.
     if      (held(g_mod.cfg.ptt_party))     channel = 1;
     else if (held(g_mod.cfg.ptt_clan))      channel = 2;
     else if (held(g_mod.cfg.ptt_ally))      channel = 3;
     else if (held(g_mod.cfg.ptt_proximity)
-          || g_mod.cfg.always_on)           channel = 0;
+          || g_mod.cfg.always_on) {
+        int sel = g_mod.ch_prefs.active_tx_channel;
+        if (sel < 0 || sel > 4) sel = 0;
+        // Mode auto-redirect (Prompt §Regra 6): when our own clan has
+        // an active operational mode AND the user hasn't explicitly
+        // picked a non-Proximity TX, route through Clan so the server's
+        // unified-mode router fans the packet to clan+ally with
+        // override. Players who explicitly switch TX (e.g. Party) are
+        // left alone — they're opting out of the mode broadcast for
+        // that PTT press.
+        if (sel == 0 && g_mod.net.LocalClanMode() != 0) {
+            sel = 2;  // Clan ingress → server rewrites to ChModeUnified
+        }
+        channel = (uint8_t)sel;
+    }
     bool transmit = focused && channel != 0xFF;
 
     static uint32_t cap_frames = 0;
@@ -113,8 +147,20 @@ void OnCaptureFrame(const int16_t* pcm, uint32_t samples) {
     if (!transmit) return;
     if (!g_mod.net.IsConnected()) return;
 
+    // APM: AEC → HPF → NS (rnnoise) → AGC. Operates in-place on a
+    // mutable copy of the frame so the capture caller still owns its
+    // buffer. The AEC reference is the most recent 20ms of mixed
+    // playback (downmix of L/R that went to the speakers) — Speex DSP
+    // adapts to the small skew between this snapshot and the actual
+    // round-trip to the mic.
+    int16_t apm_pcm[kFrameSamples];
+    std::memcpy(apm_pcm, pcm, samples * sizeof(int16_t));
+    int16_t aec_ref[kFrameSamples];
+    g_mod.playback.PopPlaybackReference(aec_ref, kFrameSamples);
+    g_mod.apm.ProcessFrame(apm_pcm, samples, aec_ref);
+
     uint8_t opus_buf[kMaxPacketBytes];
-    int n = g_mod.encoder.Encode(pcm, opus_buf, sizeof(opus_buf));
+    int n = g_mod.encoder.Encode(apm_pcm, opus_buf, sizeof(opus_buf));
     if (n <= 0) return;
 
     uint16_t seq = g_mod.tx_seq.fetch_add(1, std::memory_order_relaxed);
@@ -138,10 +184,17 @@ void OnIncomingPacket(uint8_t channel, uint32_t src, uint16_t /*seq*/,
             rx, channel, src, gain_u8, pan_i8, opus_len);
         OutputDebugStringA(dbg);
     }
-    // Channel 0 = proximity (gain/pan supplied by service).
-    // Channels 1..4 = group voice (gain=255 pan=0 by convention).
-    if (channel > 4) return;
-    if (channel != 0 && (channel < 1 || channel > 4)) return;
+    // Channel 0 = proximity (server-stamped gain/pan).
+    // Channels 1..4 = group voice (party/clan/ally/CC). The server's
+    // router pre-applies channel volume + per-player volume into gain
+    // (1.0 → 128). Pan=0 always.
+    // Channel 8 = unified-mode rewrite of CLAN/ALLY when a clan mode is
+    // active. Mixed at full volume with override (ForceAudible).
+    if (!(channel == 0 ||
+          (channel >= 1 && channel <= 4) ||
+          channel == 8)) {
+        return;
+    }
 
     OpusDecoder* dec = g_mod.DecoderFor(src);
     if (!dec) return;
@@ -262,11 +315,44 @@ static void IniWriteInt(const wchar_t* key, int value) {
     WritePrivateProfileStringW(L"voice", key, buf, g_mod.ini_path);
 }
 
+static int IniReadInt(const wchar_t* key, int fallback) {
+    if (g_mod.ini_path[0] == 0) return fallback;
+    return (int)GetPrivateProfileIntW(L"voice", key, fallback, g_mod.ini_path);
+}
+
+// Restores per-channel prefs from voice.ini. Called once during Init
+// AFTER ini_path is set. Defaults preserved when keys are absent.
+static void LoadChannelPrefs() {
+    wchar_t key[24];
+    for (int i = 0; i < 4; ++i) {
+        swprintf_s(key, L"ch_enabled_%d", i);
+        g_mod.ch_prefs.enabled[i] = IniReadInt(key, 1) != 0;
+        swprintf_s(key, L"ch_volume_%d", i);
+        int pct = IniReadInt(key, 100);
+        if (pct < 0) pct = 0;
+        if (pct > 200) pct = 200;
+        g_mod.ch_prefs.volume[i] = pct / 100.0f;
+    }
+    int sel = IniReadInt(L"active_tx_channel", 0);
+    if (sel < 0 || sel > 4) sel = 0;
+    g_mod.ch_prefs.active_tx_channel = sel;
+}
+
 bool Init(const Config& cfg) {
     if (g_mod.running.load()) return true;
     if (!cfg.enabled)         return false;
 
     g_mod.cfg = cfg;
+    LoadChannelPrefs();
+
+    // APM config — exposed in voice.ini under [voice].apm_*. Defaults
+    // match ApmConfig's defaults (AEC+NS+AGC+HPF on).
+    ApmConfig apmCfg;
+    apmCfg.aec_enabled = IniReadInt(L"apm_aec",  apmCfg.aec_enabled  ? 1 : 0) != 0;
+    apmCfg.hpf_enabled = IniReadInt(L"apm_hpf",  apmCfg.hpf_enabled  ? 1 : 0) != 0;
+    apmCfg.ns_enabled  = IniReadInt(L"apm_ns",   apmCfg.ns_enabled   ? 1 : 0) != 0;
+    apmCfg.agc_enabled = IniReadInt(L"apm_agc",  apmCfg.agc_enabled  ? 1 : 0) != 0;
+    g_mod.apm.Configure(apmCfg);
 
     if (!g_mod.encoder.Init())                       return false;
     if (!g_mod.playback.Start(cfg.playback_device))  return false;
@@ -278,8 +364,28 @@ bool Init(const Config& cfg) {
     }
 
     if (cfg.auto_connect) {
+        // On every WS open (initial + each reconnect), refresh the
+        // TCP port snapshot synchronously so the immediate TrySendAuth
+        // that follows already has the latest data. Without this hook
+        // the DLL had to wait for the next periodic render-frame poll
+        // (up to ~250ms after the fix above, but much longer during
+        // a low-FPS loading screen).
+        g_mod.net.SetWsOpenHook([]() {
+            RefreshClientPorts();
+        });
         g_mod.net.Start(cfg.ws_url,
-                        [](uint32_t /*sid*/, const char*, uint16_t) {},
+                        [](uint32_t /*sid*/, const char*, uint16_t) {
+                            // On auth, push our cached per-channel prefs
+                            // so the server's PlayerPrefs reflects local
+                            // state from voice.ini (defaults are all-on
+                            // server-side, but user may have tweaked).
+                            for (int i = 0; i < 4; ++i) {
+                                g_mod.net.SendSetChannelEnabled(
+                                    (uint8_t)i, g_mod.ch_prefs.enabled[i]);
+                                g_mod.net.SendSetChannelVolume(
+                                    (uint8_t)i, g_mod.ch_prefs.volume[i]);
+                            }
+                        },
                         &OnIncomingPacket);
         // Identity is resolved server-side via TCP source-port matching.
         // The bridge correlates this DLL's local-port list against
@@ -317,6 +423,19 @@ bool Init(const Config& cfg) {
     return true;
 }
 
+// Tracks in-world vs out-of-world transitions so we can suspend the
+// voice WS while the player is at char-select / disconnected. Updated
+// inside RefreshClientPorts; consumed by OnRenderFrame.
+static size_t   g_last_port_count  = 0;
+static int64_t  g_out_of_world_at  = 0;  // ms timestamp when port count last dropped to 0
+static bool     g_voice_suspended  = false;
+constexpr int64_t kOutOfWorldGraceMs = 5000;
+
+static int64_t NowMillis() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 void RefreshClientPorts() {
     // Exclude the WS connection itself (port 17667 by default). We
     // could parse cfg.ws_url for the actual port, but 17667 is the
@@ -326,6 +445,27 @@ void RefreshClientPorts() {
     _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
         "[l2voice] RefreshClientPorts: %zu connections\n", ports.size());
     OutputDebugStringA(dbg);
+
+    // Transition detection — used by OnRenderFrame to suspend/resume.
+    if (g_last_port_count == 0 && !ports.empty()) {
+        // Just entered world. Reset out-of-world timer; OnRenderFrame
+        // will resume the WS if it was suspended.
+        g_out_of_world_at = 0;
+        char buf[128];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "[l2voice] in-world detected (%zu port(s))\n", ports.size());
+        OutputDebugStringA(buf);
+    } else if (g_last_port_count > 0 && ports.empty()) {
+        // Just left world (char-select / DC / logout). Start grace.
+        g_out_of_world_at = NowMillis();
+        char buf[128];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "[l2voice] out-of-world detected; will suspend in %lldms\n",
+            (long long)kOutOfWorldGraceMs);
+        OutputDebugStringA(buf);
+    }
+    g_last_port_count = ports.size();
+
     if (ports.empty()) return;
     g_mod.net.SetClientPorts(ports.data(), ports.size());
 }
@@ -351,6 +491,10 @@ OverlayState SnapshotOverlayState() {
     s.always_on        = g_mod.cfg.always_on;
     s.ptt_proximity_vk = g_mod.cfg.ptt_proximity;
     s.master_volume    = g_mod.playback.GetMasterVolume();
+    for (int i = 0; i < 4; ++i) {
+        s.ch_enabled[i] = g_mod.ch_prefs.enabled[i];
+        s.ch_volume[i]  = g_mod.ch_prefs.volume[i];
+    }
     return s;
 }
 
@@ -368,9 +512,62 @@ void SetPttProximityVk(int vk) {
     g_mod.cfg.ptt_proximity = vk;
     IniWriteInt(L"ptt_proximity", vk);
 }
+void SetPttPartyVk(int vk) {
+    g_mod.cfg.ptt_party = vk;
+    IniWriteInt(L"ptt_party", vk);
+}
+void SetPttClanVk(int vk) {
+    g_mod.cfg.ptt_clan = vk;
+    IniWriteInt(L"ptt_clan", vk);
+}
+void SetPttAllyVk(int vk) {
+    g_mod.cfg.ptt_ally = vk;
+    IniWriteInt(L"ptt_ally", vk);
+}
+int GetPttPartyVk() { return g_mod.cfg.ptt_party; }
+int GetPttClanVk()  { return g_mod.cfg.ptt_clan; }
+int GetPttAllyVk()  { return g_mod.cfg.ptt_ally; }
 void SetMasterVolume(float g) {
     g_mod.playback.SetMasterVolume(g);
     IniWriteInt(L"master_volume", (int)(g * 100.0f + 0.5f));
+}
+
+// Per-channel prefs: update local cache, persist to voice.ini under
+// keys ch_enabled_<n> / ch_volume_<n>, and forward to voice-service so
+// its router sees the new value.
+//
+// `channel` is 0..3; out-of-range silently no-ops.
+void SetChannelEnabled(int channel, bool enabled) {
+    if (channel < 0 || channel > 3) return;
+    g_mod.ch_prefs.enabled[channel] = enabled;
+    wchar_t key[24];
+    _snwprintf_s(key, _TRUNCATE, L"ch_enabled_%d", channel);
+    IniWriteInt(key, enabled ? 1 : 0);
+    g_mod.net.SendSetChannelEnabled((uint8_t)channel, enabled);
+}
+
+void SetChannelVolume(int channel, float volume) {
+    if (channel < 0 || channel > 3) return;
+    if (volume < 0) volume = 0;
+    if (volume > 2) volume = 2;
+    g_mod.ch_prefs.volume[channel] = volume;
+    wchar_t key[24];
+    _snwprintf_s(key, _TRUNCATE, L"ch_volume_%d", channel);
+    IniWriteInt(key, (int)(volume * 100.0f + 0.5f));
+    g_mod.net.SendSetChannelVolume((uint8_t)channel, volume);
+}
+
+// Sets the channel that PTT (and always-on) transmits on. 0..4 valid.
+// Persisted locally — the server doesn't need to know, it just routes
+// whatever channel byte appears in the ingress packet header.
+void SetActiveTxChannel(int channel) {
+    if (channel < 0 || channel > 4) return;
+    g_mod.ch_prefs.active_tx_channel = channel;
+    IniWriteInt(L"active_tx_channel", channel);
+}
+
+int GetActiveTxChannel() {
+    return g_mod.ch_prefs.active_tx_channel;
 }
 void GetSpeakerList(SpeakerInfo* out, size_t cap, size_t& count) {
     g_mod.playback.GetSpeakerInfos(out, cap, count);
@@ -389,12 +586,101 @@ bool GetSpeakerName(uint32_t src_id, char* out, size_t cap) {
     return g_mod.net.CachedName(src_id, out, cap);
 }
 
+size_t GetGroupRoster(uint8_t group, OverlayMember* out, size_t cap) {
+    static_assert(sizeof(OverlayMember) == sizeof(VoiceNetwork::GroupMember),
+        "OverlayMember and GroupMember must have identical layout");
+    return g_mod.net.GetGroupMembers(group,
+        reinterpret_cast<VoiceNetwork::GroupMember*>(out), cap);
+}
+
+bool GetPlayerName(uint32_t player_id, char* out, size_t cap) {
+    g_mod.net.SendPlayerNameQuery(player_id);
+    return g_mod.net.CachedPlayerName(player_id, out, cap);
+}
+
+uint32_t GetCCID()           { return g_mod.net.LocalCCID(); }
+uint32_t GetCCLeaderID()     { return g_mod.net.LocalCCLeaderID(); }
+bool     GetCCCanSpeak()     { return g_mod.net.LocalCCCanSpeak(); }
+uint8_t  GetLocalRole()      { return g_mod.net.LocalRole(); }
+uint8_t  GetLocalClanMode()  { return g_mod.net.LocalClanMode(); }
+
+size_t GetActiveToasts(OverlayToast* out, size_t cap) {
+    static_assert(sizeof(OverlayToast) == sizeof(VoiceNetwork::Toast),
+        "OverlayToast and VoiceNetwork::Toast must share layout");
+    return g_mod.net.GetToasts(
+        reinterpret_cast<VoiceNetwork::Toast*>(out), cap);
+}
+
+void SendCCGrantSpeak(uint32_t target_player_id, bool granted) {
+    g_mod.net.SendCCGrantSpeak(target_player_id, granted);
+}
+void SendClanRemoteMute(uint32_t target_player_id, bool muted, const char* scope) {
+    g_mod.net.SendClanRemoteMute(target_player_id, muted, scope);
+}
+void SendClanSetMode(uint8_t mode) {
+    g_mod.net.SendClanSetMode(mode);
+}
+void SendClanPromoteSub(uint32_t target_player_id, bool promote) {
+    g_mod.net.SendClanPromoteSubLeader(target_player_id, promote);
+}
+
 void OnRenderFrame() {
     // Refresh the TCP-port list periodically — by the time the user
     // is in-world, their L2 client has opened the GS socket; before
     // that there's nothing useful to send. Cheap (one syscall).
+    // Poll the L2 TCP table every 15 render frames (~250ms at 60 fps;
+    // ~5s during a low-fps loading screen). Faster than the original
+    // 1s poll so the voice auth fires sooner after the player enters
+    // the world. The on-ws-open hook below covers reconnect cases.
     static int counter = 0;
-    if ((counter++ % 60) == 0) RefreshClientPorts();
+    if ((counter++ % 15) == 0) RefreshClientPorts();
+    // WS ping for round-trip latency. SendPingTick already self-throttles
+    // to once per ~2 s, so calling each frame is fine.
+    g_mod.net.SendPingTick();
+
+    // Auto-suspend the voice WS when the L2 client has been at
+    // char-select / disconnected / logout for the grace window. The
+    // server-side session is otherwise dropped on player_logout but
+    // the WS stays open, holding a TCP slot for nothing. When the
+    // player re-enters world, ports return → resume.
+    int64_t now_ms = NowMillis();
+    if (!g_voice_suspended
+        && g_out_of_world_at > 0
+        && (now_ms - g_out_of_world_at) > kOutOfWorldGraceMs) {
+        char buf[160];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "[l2voice] suspending voice WS — player out of world for %lldms\n",
+            (long long)(now_ms - g_out_of_world_at));
+        OutputDebugStringA(buf);
+        g_mod.net.SuspendWs();
+        g_voice_suspended = true;
+    }
+    if (g_voice_suspended && g_last_port_count > 0) {
+        OutputDebugStringA("[l2voice] resuming voice WS — player back in world\n");
+        g_mod.net.ResumeWs();
+        g_voice_suspended = false;
+    }
+}
+
+int GetVoicePingMs() {
+    return g_mod.net.LastPingMs();
+}
+
+void GetMiniListPos(int* x, int* y) {
+    if (x) *x = IniReadInt(L"mini_list_x", 0);
+    if (y) *y = IniReadInt(L"mini_list_y", 0);
+}
+void SaveMiniListPos(int x, int y) {
+    IniWriteInt(L"mini_list_x", x);
+    IniWriteInt(L"mini_list_y", y);
+}
+void GetMicIconPos(int* x, int* y) {
+    if (x) *x = IniReadInt(L"mic_icon_x", 0);
+    if (y) *y = IniReadInt(L"mic_icon_y", 0);
+}
+void SaveMicIconPos(int x, int y) {
+    IniWriteInt(L"mic_icon_x", x);
+    IniWriteInt(L"mic_icon_y", y);
 }
 
 void SetAuthToken(const char* /*token*/, uint32_t /*player_id*/) {

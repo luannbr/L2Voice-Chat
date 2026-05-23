@@ -22,6 +22,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/luannbr/l2voice/voice-service/internal/topology"
+	"github.com/luannbr/l2voice/voice-service/internal/world"
 )
 
 // WhoamiEndpoint is the URL of the L2J bridge /voice/whoami endpoint.
@@ -68,11 +69,15 @@ var upgrader = websocket.Upgrader{
 
 // Serve starts the WebSocket control plane on listenAddr (e.g. ":17667").
 // Returns when ctx is cancelled.
-func Serve(ctx context.Context, listenAddr string, state *topology.State) error {
+func Serve(ctx context.Context, listenAddr string, state *topology.State,
+	worldState *world.WorldState, reg *ConnReg) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		handleWS(ctx, w, r, state)
+		handleWS(ctx, w, r, state, worldState, reg)
 	})
+	// POC: outbound link from the L2J bridge. Lives on the same port
+	// so VPS firewall stays single-rule. See bridge_link.go.
+	mux.HandleFunc("/bridge", HandleBridgeWS)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
@@ -100,7 +105,8 @@ func Serve(ctx context.Context, listenAddr string, state *topology.State) error 
 	return err
 }
 
-func handleWS(ctx context.Context, w http.ResponseWriter, r *http.Request, state *topology.State) {
+func handleWS(ctx context.Context, w http.ResponseWriter, r *http.Request,
+	state *topology.State, worldState *world.WorldState, reg *ConnReg) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("control: upgrade error: %v", err)
@@ -116,7 +122,16 @@ func handleWS(ctx context.Context, w http.ResponseWriter, r *http.Request, state
 	// DLL to re-send on auth_pending — most DLL builds won't, since
 	// their port list is stable from "Login" click onward.
 	clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
-	authDeadline := time.Now().Add(5 * time.Minute)
+	// Auth window — was 5 minutes, dropped to 30 s to bound the
+	// rpc_whoami retry budget per connection. The DLL reconnects
+	// roughly every 20 s due to IXWebSocket heartbeat handling;
+	// if we keep a 5 min window, every reconnect spawns its own
+	// 5-min retry loop and the bridge sees a constant flood of
+	// whoami queries from orphaned auth-loops. 30 s is enough to
+	// cover the latency of a player entering the world from char-
+	// select right after the WS opens, while keeping orphan loops
+	// short.
+	authDeadline := time.Now().Add(30 * time.Second)
 	conn.SetReadDeadline(authDeadline)
 	_, raw, err := conn.ReadMessage()
 	if err != nil {
@@ -135,11 +150,14 @@ func handleWS(ctx context.Context, w http.ResponseWriter, r *http.Request, state
 	log.Printf("control: %s auth ports=%v clientIP=%q (resolving...)",
 		r.RemoteAddr, msg.Ports, clientIP)
 
-	// Now poll the bridge until it resolves the player.
+	// Poll the bridge until it resolves the player, with exponential
+	// backoff (2s → 4s → 8s → max 8s). Coupled with the 30s auth
+	// window, that yields at most ~4 RPCs per pending connection.
 	var playerID uint32
+	backoff := 2 * time.Second
 	for {
 		if time.Now().After(authDeadline) {
-			log.Printf("control: %s auth window exhausted (5 min)", r.RemoteAddr)
+			log.Printf("control: %s auth window exhausted (30s)", r.RemoteAddr)
 			_ = conn.WriteJSON(authFail{Type: "auth_fail", Reason: "auth_timeout"})
 			return
 		}
@@ -148,12 +166,13 @@ func handleWS(ctx context.Context, w http.ResponseWriter, r *http.Request, state
 			playerID = pid
 			break
 		}
-		// Sleep before retrying. Cheap: one HTTP call to bridge per
-		// pending client every 2 s, only while not-yet-resolved.
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(2 * time.Second):
+		case <-time.After(backoff):
+		}
+		if backoff < 8*time.Second {
+			backoff *= 2
 		}
 	}
 	log.Printf("control: %s auth resolved player=%d (ports=%v)",
@@ -162,8 +181,19 @@ func handleWS(ctx context.Context, w http.ResponseWriter, r *http.Request, state
 	sess := state.AllocSession(playerID)
 	defer state.Drop(sess.ID)
 
+	// Register the player in the world (if not yet seen via Redis
+	// events). This guarantees Prefs exists before the first command.
+	if worldState.Player(playerID) == nil {
+		worldState.UpsertPlayer(playerID, 0, 0, 0, 0, false)
+	}
+	worldState.SetPlayerSession(playerID, sess.ID)
+
+	client := &Client{SID: sess.ID, PlayerID: playerID, conn: conn}
+	reg.Register(client)
+	defer reg.Unregister(sess.ID)
+
 	udpEndpoint := udpEndpointFor(r)
-	if err := conn.WriteJSON(authOk{
+	if err := client.Send(authOk{
 		Type:         "auth_ok",
 		SessionID:    sess.ID,
 		UDPEndpoint:  udpEndpoint,
@@ -171,6 +201,14 @@ func handleWS(ctx context.Context, w http.ResponseWriter, r *http.Request, state
 	}); err != nil {
 		return
 	}
+	// Push initial world snapshot so the DLL can populate tab member
+	// lists, leader panel visibility, mode banner, and CC tab.
+	initFrame := buildClientState(playerID, worldState, state)
+	log.Printf("control: auth-time client_state for player=%d clan=%d ally=%d party=%d cc=%d members=%d/%d/%d/%d",
+		playerID, initFrame.ClanID, initFrame.AllyID, initFrame.PartyID, initFrame.CCID,
+		len(initFrame.PartyMembers), len(initFrame.ClanMembers),
+		len(initFrame.AllyMembers), len(initFrame.CCMembers))
+	_ = client.Send(initFrame)
 	log.Printf("control: %s authed as session=%d player=%d",
 		r.RemoteAddr, sess.ID, playerID)
 
@@ -178,10 +216,8 @@ func handleWS(ctx context.Context, w http.ResponseWriter, r *http.Request, state
 	// timeout for liveness checks.
 	conn.SetReadDeadline(time.Time{})
 
-	// Post-auth read loop. Currently handles one message type:
-	//   name_query → look up the player_id of the requested sid via
-	//   the topology table, then ask the bridge for the character
-	//   name, reply with name_result. Everything else is ignored.
+	dep := deps{world: worldState, topo: state, reg: reg}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -193,21 +229,61 @@ func handleWS(ctx context.Context, w http.ResponseWriter, r *http.Request, state
 			log.Printf("control: session %d closed (%v)", sess.ID, err)
 			return
 		}
-		var hdr struct {
-			Type  string `json:"type"`
-			SrcID uint32 `json:"src_id"`
-		}
-		if err := json.Unmarshal(raw, &hdr); err != nil {
-			continue
-		}
-		if hdr.Type == "name_query" && hdr.SrcID != 0 {
-			handleNameQuery(conn, state, hdr.SrcID)
+		if !dispatch(client, raw, dep) {
+			// Unknown / malformed type — drop silently. (Logging every
+			// unparsed frame would be too noisy at scale.)
 		}
 	}
 }
 
+// handlePlayerNameQuery resolves the character name for an L2 player
+// object-id and replies with player_name_result. Unlike handleNameQuery
+// (which keys by audio src_id = session_id), this works for arbitrary
+// online player ids — used by the DLL to populate group rosters from
+// client_state.
+//
+// Phase A: prefer the outbound bridge link (RPC). Fall back to HTTP
+// when no bridge is connected.
+func handlePlayerNameQuery(c *Client, playerID uint32) {
+	out := map[string]interface{}{
+		"type":      "player_name_result",
+		"player_id": playerID,
+	}
+	if b := FirstActiveBridge(); b != nil {
+		if name, err := b.RPCName(playerID); err == nil {
+			out["name"] = name
+			_ = c.Send(out)
+			return
+		} else {
+			log.Printf("control: bridge RPC name(%d) failed (%v) — falling back to HTTP", playerID, err)
+		}
+	}
+	if nameEndpoint == "" {
+		out["name"] = ""
+		_ = c.Send(out)
+		return
+	}
+	url := fmt.Sprintf("%s?player_id=%d", nameEndpoint, playerID)
+	client := http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		out["name"] = ""
+		_ = c.Send(out)
+		return
+	}
+	defer resp.Body.Close()
+	var body struct {
+		PlayerID uint32 `json:"player_id"`
+		Name     string `json:"name"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&body)
+	out["name"] = body.Name
+	_ = c.Send(out)
+}
+
 // handleNameQuery resolves the character name for a sid the WS client
-// is asking about and sends back name_result.
+// is asking about and sends back name_result. Tries bridge RPC first
+// (Phase A), falls back to the HTTP /voice/name endpoint.
 func handleNameQuery(conn *websocket.Conn, state *topology.State, srcID uint32) {
 	target := state.LookupBySID(srcID)
 	type nameResult struct {
@@ -216,7 +292,18 @@ func handleNameQuery(conn *websocket.Conn, state *topology.State, srcID uint32) 
 		Name   string `json:"name"`
 	}
 	out := nameResult{Type: "name_result", SrcID: srcID}
-	if target == nil || target.PlayerID == 0 || nameEndpoint == "" {
+	if target == nil || target.PlayerID == 0 {
+		_ = conn.WriteJSON(out)
+		return
+	}
+	if b := FirstActiveBridge(); b != nil {
+		if name, err := b.RPCName(target.PlayerID); err == nil {
+			out.Name = name
+			_ = conn.WriteJSON(out)
+			return
+		}
+	}
+	if nameEndpoint == "" {
 		_ = conn.WriteJSON(out)
 		return
 	}
@@ -273,7 +360,19 @@ func indexLastByte(s string, b byte) int {
 // whoamiLookup asks the L2J bridge "which player owns the TCP socket
 // from clientIP with one of these source ports?" Returns 0 if no
 // player matches.
+//
+// Phase A: prefer the outbound bridge link (RPC over WS). Fall back
+// to the inbound HTTP callback when no bridge is connected — keeps
+// pure-Redis deployments backwards-compatible while we transition.
 func whoamiLookup(clientIP string, ports []uint16) (uint32, error) {
+	if b := FirstActiveBridge(); b != nil {
+		pid, err := b.RPCWhoami(clientIP, ports)
+		if err == nil {
+			return pid, nil
+		}
+		// Log and fall through to HTTP.
+		log.Printf("control: bridge RPC whoami failed (%v) — falling back to HTTP", err)
+	}
 	if whoamiEndpoint == "" {
 		return 0, fmt.Errorf("no whoami endpoint configured")
 	}

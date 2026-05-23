@@ -26,6 +26,12 @@
 
 namespace voice {
 
+// Callback fired when the WS transport opens — BEFORE auth happens.
+// Lets the caller refresh its TCP-port snapshot so the immediate
+// TrySendAuth that follows has fresh data. Without this, the DLL
+// would have to wait for the next periodic poll (~1s+) to retry.
+using WsOpenCallback = std::function<void()>;
+
 // Callback fired when the service confirms auth and assigns a session.
 using AuthOkCallback = std::function<void(uint32_t session_id,
                                           const char* udp_host,
@@ -50,6 +56,20 @@ public:
     // Starts the WS and UDP threads. ws_url like "ws://host:port/path".
     bool Start(const char* ws_url, AuthOkCallback on_auth,
                PacketCallback on_packet);
+
+    // Optional: register a hook that runs synchronously inside the
+    // IXWebSocket Open handler, BEFORE the immediate TrySendAuth.
+    // Use it to refresh per-session state (e.g., the L2 TCP port
+    // list) so the very first auth attempt on each reconnect has
+    // fresh inputs. Must be set before Start.
+    void SetWsOpenHook(WsOpenCallback on_open);
+
+    // Soft-suspend the WS without tearing down the whole VoiceNetwork.
+    // Closes the current connection and disables auto-reconnect; safe
+    // to call multiple times. UDP socket stays open.
+    void SuspendWs();
+    // Re-enable auto-reconnect and start a new WS connection.
+    void ResumeWs();
     void Stop();
 
     // Provide the list of TCP local ports owned by this process. The
@@ -75,6 +95,27 @@ public:
     // session_id is valid and not actively transmitting.
     void SendKeepalive();
 
+    // Send a WS ping. The voice-service echoes back the same timestamp
+    // as a "pong" message, from which we compute the round-trip time.
+    // Call periodically from the render loop (~every 2 s is fine).
+    void SendPingTick();
+    // Latest round-trip time in milliseconds, or -1 if no reply yet.
+    int  LastPingMs() const;
+
+    // ---- Notification toasts -------------------------------------------
+    // Server-pushed user-facing notifications (remote mute, etc.) are
+    // queued here for the overlay to render. Auto-expire after ~5 s.
+    struct Toast {
+        uint32_t id;             // monotonic, unique per toast
+        char     text[192];      // pre-formatted message
+        uint8_t  severity;       // 0=info, 1=warn, 2=error, 3=success
+        int64_t  created_ms;     // steady_clock ms
+        int64_t  dismiss_ms;     // steady_clock ms when it should fade out
+    };
+    // Copies up to `cap` active (non-expired) toasts into `out`. Returns
+    // count written. cap=0/out=nullptr → just query the count.
+    size_t GetToasts(Toast* out, size_t cap) const;
+
     bool IsConnected() const;
     uint32_t SessionID() const;
     // Player id that the voice-service resolved for this session
@@ -87,6 +128,55 @@ public:
     // string until the server replies.
     void SendNameQuery(uint32_t src_id);
     bool CachedName(uint32_t src_id, char* out, size_t cap);
+
+    // ---- Group roster (from server's client_state push) ---------------
+    // The server sends a `client_state` message on auth and on every
+    // relevant world change. The DLL caches the snapshot and exposes
+    // it to the overlay through these accessors. Thread-safe.
+
+    struct GroupMember {
+        uint32_t player_id;
+        bool     voice_active;   // has a live voice session right now
+        uint8_t  clan_role;      // clan tab only: 0=member,1=sub,2=leader
+        bool     cc_can_speak;   // CC tab only
+        bool     remote_muted;   // clan/ally only — server-side remote mute is active on this member
+    };
+
+    // 0..3 = Party/Clan/Ally/CC. Returns the count written. Pass cap=0
+    // to query size only (no copy).
+    size_t GetGroupMembers(uint8_t group, GroupMember* out, size_t cap) const;
+
+    // The local player's own role (in their clan). 0=member,1=sub,2=leader.
+    uint8_t LocalRole() const;
+
+    // Local player's clan/ally/party/cc identifiers (0 = none).
+    uint32_t LocalClanID() const;
+    uint32_t LocalAllyID() const;
+    uint64_t LocalPartyID() const;
+    uint32_t LocalCCID() const;
+    uint32_t LocalCCLeaderID() const;
+    bool     LocalCCCanSpeak() const;
+    uint8_t  LocalClanMode() const;
+
+    // Asks the voice-service for the character name behind a given
+    // L2 player id (different from src_id which is a session_id used
+    // for audio-source naming). Result cached just like name_query.
+    void SendPlayerNameQuery(uint32_t player_id);
+    bool CachedPlayerName(uint32_t player_id, char* out, size_t cap);
+
+    // ---- Clan-voice control commands (Phase C of the spec) -------------
+    // All of these are no-ops if the WS is not connected. The server is
+    // the source of truth — it validates authorization on every command.
+    void SendSetChannelEnabled(uint8_t channel, bool enabled);
+    void SendSetChannelVolume(uint8_t channel, float volume);
+    void SendSetPlayerMute(uint32_t target_player_id, bool muted);
+    void SendSetPlayerVolume(uint32_t target_player_id, float volume);
+    void SendClanSetMode(uint8_t mode);                    // 0=None, 1=PVP, 2=Siege, 3=Boss, 4=Farm
+    void SendWhisperSet(uint8_t mode, int vk);             // 0=off, 1=PTT, 2=always
+    void SendClanPromoteSubLeader(uint32_t target_player_id, bool promote);
+    void SendClanRemoteMute(uint32_t target_player_id, bool muted, const char* scope);
+    void SendClanOptOutUnified(bool opt_out);
+    void SendCCGrantSpeak(uint32_t target_player_id, bool granted);
 
 private:
     struct Impl;

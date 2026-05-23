@@ -1,0 +1,12 @@
+// Minimal resource script — only the microphone-state icons. Used
+// when VOICE_L2_THEME=OFF (the default for the open-source build).
+// The L2UI_CH3 textures referenced by the full resources.rc.in are
+// NCSoft IP and not distributed; users who own a client can enable
+// VOICE_L2_THEME=ON and supply their own l2ui_assets/ folder.
+
+#include "resources.h"
+
+IDR_MIC_PNG               RCDATA  "@MIC_PNG_PATH@"
+IDR_MIC_SPEAKING_PNG      RCDATA  "@MIC_SPEAKING_PNG_PATH@"
+IDR_MIC_MUTED_PNG         RCDATA  "@MIC_MUTED_PNG_PATH@"
+IDR_MIC_BLOCKED_PNG       RCDATA  "@MIC_BLOCKED_PNG_PATH@"
